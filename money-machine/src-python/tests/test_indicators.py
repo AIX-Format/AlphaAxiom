@@ -39,6 +39,7 @@ if str(SRC_PYTHON) not in sys.path:
 
 from engine.indicators import (  # noqa: E402
     atr,
+    bollinger_bands,
     ema,
     macd,
     rsi,
@@ -323,6 +324,48 @@ def test_atr_reference_values_period_three() -> None:
             assert math.isnan(out.iloc[i])
         else:
             assert math.isclose(out.iloc[i], exp, abs_tol=1e-9), f"atr[{i}]"
+
+
+# ---------------------------------------------------------------------------
+# Invariants: Bollinger Bands
+# ---------------------------------------------------------------------------
+
+
+def test_bollinger_bands_ordering_and_alignment(fixture_df: pd.DataFrame) -> None:
+    upper, middle, lower = bollinger_bands(
+        fixture_df["close"], period=20, num_std=2.0
+    )
+    # Index preserved.
+    assert upper.index.equals(fixture_df.index)
+    assert middle.index.equals(fixture_df.index)
+    assert lower.index.equals(fixture_df.index)
+    # Warm-up window: first period-1 rows are NaN.
+    assert upper.iloc[:19].isna().all()
+    assert middle.iloc[:19].isna().all()
+    assert lower.iloc[:19].isna().all()
+    # Ordering invariant: upper >= middle >= lower wherever defined.
+    valid = upper.notna() & middle.notna() & lower.notna()
+    assert (upper[valid] >= middle[valid]).all()
+    assert (middle[valid] >= lower[valid]).all()
+
+
+def test_bollinger_bands_collapse_on_constant_series() -> None:
+    s = pd.Series([50.0] * 30)
+    upper, middle, lower = bollinger_bands(s, period=10, num_std=2.0)
+    # No variance: upper = middle = lower after warm-up.
+    assert (upper.dropna() == 50.0).all()
+    assert (middle.dropna() == 50.0).all()
+    assert (lower.dropna() == 50.0).all()
+
+
+def test_bollinger_bands_validates_args() -> None:
+    s = pd.Series([1.0, 2.0, 3.0])
+    with pytest.raises(ValueError):
+        bollinger_bands(s, period=0)
+    with pytest.raises(ValueError):
+        bollinger_bands(s, period=10, num_std=0.0)
+    with pytest.raises(ValueError):
+        bollinger_bands(s, period=10, num_std=-1.0)
 
 
 def test_macd_returns_three_aligned_series(fixture_df: pd.DataFrame) -> None:

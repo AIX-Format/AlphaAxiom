@@ -224,6 +224,35 @@ def atr(
 
 
 # ---------------------------------------------------------------------------
+# Bands
+# ---------------------------------------------------------------------------
+
+
+def bollinger_bands(
+    close: pd.Series,
+    period: int = 20,
+    num_std: float = 2.0,
+) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    """Bollinger Bands.
+
+    Returns `(upper, middle, lower)` aligned to the input index, where
+    `middle = sma(close, period)` and the bands are `num_std`
+    population standard deviations away from the middle band. NaN for
+    the first `period - 1` rows. Standard deviation uses `ddof=0`
+    (population) to match TradingView's `ta.stdev(close, length)`
+    default.
+    """
+    _validate_period(period)
+    if num_std <= 0:
+        raise ValueError(f"num_std must be positive, got {num_std!r}")
+    middle = close.rolling(window=period, min_periods=period).mean()
+    std = close.rolling(window=period, min_periods=period).std(ddof=0)
+    upper = middle + num_std * std
+    lower = middle - num_std * std
+    return upper, middle, lower
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
