@@ -43,7 +43,11 @@ class BreakoutStrategy(Strategy):
         super().__init__(symbol)
         if lookback < 2:
             raise ValueError(f"lookback must be >= 2, got {lookback}")
-        if not isinstance(atr_period, int) or atr_period < 1:
+        if (
+            not isinstance(atr_period, int)
+            or isinstance(atr_period, bool)
+            or atr_period < 1
+        ):
             raise ValueError(f"atr_period must be int >= 1, got {atr_period!r}")
         if breakout_atr_mult < 0:
             raise ValueError(

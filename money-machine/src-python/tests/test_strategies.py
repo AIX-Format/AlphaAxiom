@@ -341,6 +341,8 @@ def test_breakout_rejects_tiny_lookback() -> None:
     [
         {"atr_period": 0},
         {"atr_period": -3},
+        {"atr_period": True},  # bool sneaks past isinstance(int) without explicit guard
+        {"atr_period": False},
         {"breakout_atr_mult": -0.1},
         {"atr_stop_mult": 0},
         {"atr_stop_mult": -1.0},
