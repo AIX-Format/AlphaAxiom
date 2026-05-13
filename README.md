@@ -1,3 +1,35 @@
+<!-- ════════════════ AIX SOVEREIGN STACK · UNIFIED BRANDING ════════════════ -->
+
+<div align="center">
+  <img src="./assets/aix-stack-header-v2.svg" alt="The AIX Sovereign Stack. Echo369. L0 Root Authority. L1 Protocol. L2 Runtime. L3 Marketplace. L4-L6 Satellites" width="100%"/>
+</div>
+
+<div align="center">
+
+[![AIX Stack](https://img.shields.io/badge/AIX%20STACK-Echo369-39FF14?style=for-the-badge&labelColor=050505)](https://github.com/Moeabdelaziz007/aix-format/blob/main/AXIOM.md)
+[![Spec](https://img.shields.io/badge/SPEC-AIX%2F1.0-39FF14?style=for-the-badge&labelColor=050505)](https://github.com/Moeabdelaziz007/aix-format/blob/main/AXIOM.md)
+[![Layer](https://img.shields.io/badge/LAYER-L4%20%C2%B7%20SATELLITE%20TRADING-39FF14?style=for-the-badge&labelColor=050505)](https://github.com/Moeabdelaziz007/AlphaAxiom)
+[![Version](https://img.shields.io/badge/version-v0.1.0--alpha-39FF14?style=for-the-badge&labelColor=050505)](./money-machine/package.json)
+[![License](https://img.shields.io/badge/LICENSE-MIT-39FF14?style=for-the-badge&labelColor=050505)](./LICENSE)
+
+</div>
+
+<div align="center">
+
+**Satellite Layer** &nbsp;.&nbsp; [**↑ L0 `axiomid-project`**](https://github.com/Moeabdelaziz007/axiomid-project) &nbsp;.&nbsp; Sovereign Core: [**L1 `aix-format`**](https://github.com/Moeabdelaziz007/aix-format) &nbsp;.&nbsp; [**L2 `iqra`**](https://github.com/Moeabdelaziz007/iqra) &nbsp;.&nbsp; [**L3 `aix-agent-skills`**](https://github.com/Moeabdelaziz007/aix-agent-skills) &nbsp;.&nbsp; **💹 L4 . `AlphaAxiom` . YOU ARE HERE**
+
+</div>
+
+<div align="center">
+
+<sub>Sibling satellites: [**L5 `PiWorker-OS`**](https://github.com/Moeabdelaziz007/PiWorker-OS) &nbsp;.&nbsp; [**L6 `GemClaw`**](https://github.com/Moeabdelaziz007/GemClaw) &nbsp;.&nbsp; AlphaAxiom buys skills from L3 via x402 and records receipts in L2 TrustChain</sub>
+
+</div>
+
+<br/>
+
+<!-- ════════════════ /AIX SOVEREIGN STACK ════════════════ -->
+
 <p align="center">
   <img src="money-machine/public/images/logo.png" alt="AlphaAxiom" width="120">
 </p>
@@ -251,3 +283,25 @@ MIT License - See [LICENSE](LICENSE) for details.
   Made with 💜 in Egypt 🇪🇬<br>
   <em>Part of the Axiom Ecosystem</em>
 </p>
+
+<!-- ════════════════ AIX SOVEREIGN STACK . FOOTER ════════════════ -->
+
+---
+
+<div align="center">
+
+[**↑ L0 `axiomid-project`**](https://github.com/Moeabdelaziz007/axiomid-project) &nbsp;.&nbsp; [**L1 `aix-format`**](https://github.com/Moeabdelaziz007/aix-format) &nbsp;.&nbsp; [**L2 `iqra`**](https://github.com/Moeabdelaziz007/iqra) &nbsp;.&nbsp; [**L3 `aix-agent-skills`**](https://github.com/Moeabdelaziz007/aix-agent-skills) &nbsp;.&nbsp; **💹 L4 . `AlphaAxiom` . YOU ARE HERE**
+
+</div>
+
+<div align="center">
+
+<sub>Sibling satellites: [**L5 `PiWorker-OS`**](https://github.com/Moeabdelaziz007/PiWorker-OS) &nbsp;.&nbsp; [**L6 `GemClaw`**](https://github.com/Moeabdelaziz007/GemClaw)</sub>
+
+</div>
+
+<div align="center">
+  <img src="./assets/aix-footer-quote-v2.svg" alt="AIX Stack. Echo369. King is not Born, he is Made." width="100%"/>
+</div>
+
+<!-- ════════════════ /AIX SOVEREIGN STACK . FOOTER ════════════════ -->

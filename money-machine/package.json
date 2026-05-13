@@ -1,6 +1,14 @@
 {
   "name": "money-machine",
   "version": "0.1.0",
+  "aix": {
+    "stackVersion": "0.369.0",
+    "stackCodename": "Echo369",
+    "spec": "AIX/1.0",
+    "layer": "L4",
+    "layerName": "satellite-trading",
+    "authority": "axiomid.app"
+  },
   "private": true,
   "scripts": {
     "dev": "next dev",
