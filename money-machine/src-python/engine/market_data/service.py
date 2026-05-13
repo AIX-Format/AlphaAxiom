@@ -253,19 +253,20 @@ class MarketDataService:
         """Return [start, end) segments inside [start_ms, end_ms) that
         are not yet present in the cache.
 
-        For the MVP we treat the cache as a single contiguous range:
-        if it covers the requested window we return []; otherwise
-        we fetch the head gap and the tail gap separately. Internal
-        gaps inside the cached range are rare in production (Binance
-        is usually contiguous) and would require a denser
-        scan-by-bar that we do not need yet.
+        Detects three kinds of gap:
 
-        When `interval_ms` is supplied we use it to derive the
-        candle granularity: the next candle after `cached_max` is
-        at `cached_max + interval_ms`, so a request that ends at or
-        before that boundary has no tail gap. Without
-        `interval_ms` we fall back to a one-millisecond increment,
-        which over-fetches on the tail by at most one empty page.
+        1. Head gap: [start_ms, cached_min) when the request
+           starts before the cache.
+        2. Internal gaps: any bar boundary inside
+           [cached_min, cached_max] where two consecutive cached
+           rows are more than `interval_ms` apart. Internal holes
+           appear naturally when _load_cache drops malformed rows
+           (a manual edit, a partial write, a venue maintenance
+           gap); without detecting them we would silently serve an
+           incomplete series. Skipped when `interval_ms` is None
+           since we cannot tell what counts as a hole.
+        3. Tail gap: [next_candle_open, end_ms) when the request
+           ends past the cache.
         """
         if cached.empty:
             return [(start_ms, end_ms)]
@@ -274,6 +275,22 @@ class MarketDataService:
         gaps: List[Tuple[int, int]] = []
         if start_ms < cached_min:
             gaps.append((start_ms, min(cached_min, end_ms)))
+
+        if interval_ms is not None and len(cached) > 1:
+            # Walk consecutive open-times. A diff bigger than
+            # interval_ms means a hole; intersect each hole with
+            # the requested window so we never fetch outside it.
+            opens = cached["open_time_ms"].to_numpy()
+            for i in range(1, len(opens)):
+                prev = int(opens[i - 1])
+                curr = int(opens[i])
+                expected_next = prev + interval_ms
+                if curr > expected_next:
+                    hole_start = max(expected_next, start_ms)
+                    hole_end = min(curr, end_ms)
+                    if hole_end > hole_start:
+                        gaps.append((hole_start, hole_end))
+
         next_candle_open = cached_max + (interval_ms or 1)
         if end_ms > next_candle_open:
             gaps.append((max(next_candle_open, start_ms), end_ms))

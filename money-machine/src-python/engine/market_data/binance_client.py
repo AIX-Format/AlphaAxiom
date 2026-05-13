@@ -90,7 +90,13 @@ class BinancePublicClient:
         if end_ms <= start_ms:
             return []
 
-        symbol_clean = symbol.replace("/", "").upper()
+        # Binance public API expects symbols like BTCUSDT, no
+        # delimiters. Strip BOTH the slash (e.g. BTC/USDT) and the
+        # colon-suffixed contract suffix (e.g. BTC/USDT:USDT used
+        # by ccxt for perpetuals); the cache layer already accepts
+        # colon-delimited filenames so the two layers agree on the
+        # input shape.
+        symbol_clean = symbol.split(":", 1)[0].replace("/", "").upper()
         per_request = self.config.max_per_request
         interval_ms = INTERVAL_MS[interval]
         out: List[Candle] = []

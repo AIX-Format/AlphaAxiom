@@ -459,6 +459,56 @@ def test_concurrent_get_ohlcv_for_same_key_does_not_lose_writes(tmp_path: Path) 
     _run(scenario())
 
 
+def test_binance_client_strips_colon_contract_suffix() -> None:
+    """ccxt-style symbols like 'BTC/USDT:USDT' must be normalised to
+    'BTCUSDT' before hitting Binance; otherwise Binance rejects
+    them as invalid and the fetch returns empty.
+    """
+    async def scenario() -> None:
+        rows = _build_klines(start_ms=0, count=2)
+        fetch = _FakeHttpFetch([json.dumps(rows).encode("utf-8")])
+        client = BinancePublicClient(http_fetch=fetch)
+        await client.fetch_klines("BTC/USDT:USDT", "1h", 0, 2 * HOUR_MS)
+        # The request that hit the API used the clean symbol.
+        _, params = fetch.calls[0]
+        assert params["symbol"] == "BTCUSDT"
+
+    _run(scenario())
+
+
+def test_missing_ranges_detects_internal_hole(tmp_path: Path) -> None:
+    """A cache with an internal hole (e.g. one row was dropped by
+    _load_cache's malformed-row filter) must trigger a refetch of
+    the hole on the next get_ohlcv, not silently return an
+    incomplete window.
+    """
+    async def scenario() -> None:
+        # Engineer a stub client with a fixed 10-candle universe.
+        client = _StubClient(_candles(0, 10))
+        svc = MarketDataService(client=client, cache_dir=tmp_path)
+        await svc.get_ohlcv("BTC/USDT", "1h", 0, 10 * HOUR_MS)
+
+        # Manually punch a hole in the cache by editing the CSV.
+        path = next(tmp_path.glob("*.csv"))
+        lines = path.read_text().splitlines()
+        # lines[0]=header, lines[1..10]=candles. Drop candle 5.
+        del lines[5]
+        path.write_text("\n".join(lines) + "\n")
+
+        client.calls.clear()
+        await svc.get_ohlcv("BTC/USDT", "1h", 0, 10 * HOUR_MS)
+        # One upstream call covering the internal hole.
+        assert len(client.calls) == 1
+        _, _, gap_start, gap_end = client.calls[0]
+        # The dropped candle's open_time was 4*HOUR_MS (0-indexed
+        # row 5 = original index 4); the hole spans
+        # [4*HOUR_MS, 5*HOUR_MS).
+        assert gap_start == 4 * HOUR_MS
+        assert gap_end == 5 * HOUR_MS
+
+    _run(scenario())
+
+
 def test_service_output_feeds_backtest_engine(tmp_path: Path) -> None:
     async def scenario() -> None:
         client = _StubClient(_candles(1_700_000_000_000, 30))
