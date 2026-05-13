@@ -274,15 +274,17 @@ class Backtest:
             # 1) Mark-to-market any open position at this bar's close.
             #    Also check whether stop/take fired intra-bar.
             if position is not None:
-                exit_info = position.check_intrabar(highs[t], lows[t])
+                exit_info = position.check_intrabar(opens[t], highs[t], lows[t])
                 if exit_info is not None:
                     trigger_price, reason = exit_info
                     # Stop/take fills experience slippage just like any
                     # other order. Longs sell to exit (slip down); shorts
-                    # buy to exit (slip up).
+                    # buy to exit (slip up). ATR uses the bar PRIOR to
+                    # the fill (t-1): bar t's full range is not yet
+                    # known when the stop or take fires intra-bar.
                     exit_side = "sell" if position.direction == "long" else "buy"
                     exit_price = self.slippage.apply(
-                        trigger_price, exit_side, atr=_bar_atr(t)
+                        trigger_price, exit_side, atr=_bar_atr(t - 1)
                     )
                     realised = position.close(
                         exit_price, index[t], reason, self.commission
@@ -314,7 +316,10 @@ class Backtest:
             if not signal.is_actionable():
                 continue
 
-            next_atr = _bar_atr(t + 1)
+            # Use ATR known at bar t close, NOT bar t+1's ATR which
+            # would be derived from bar t+1's own high/low/close and
+            # thus look-ahead-biased relative to fills at opens[t+1].
+            next_atr = _bar_atr(t)
 
             # 4) Apply the signal on the NEXT bar's open. If we have an
             #    open position in the opposite direction, close it first.
@@ -358,7 +363,9 @@ class Backtest:
 
         # 5) Force-close anything still open at the final bar's close.
         if position is not None:
-            final_atr = _bar_atr(n - 1)
+            # Use ATR known at bar n-2 to avoid look-ahead on the
+            # forced close happening at bar n-1's close.
+            final_atr = _bar_atr(n - 2)
             exit_side = "sell" if position.direction == "long" else "buy"
             slipped_close = self.slippage.apply(
                 closes[-1], exit_side, atr=final_atr
@@ -430,20 +437,39 @@ class _OpenPosition:
     record: Optional[TradeRecord] = None
 
     def check_intrabar(
-        self, high: float, low: float
+        self, open_price: float, high: float, low: float
     ) -> Optional[tuple]:
-        """Return (exit_price, reason) if stop/take fires this bar."""
+        """Return `(exit_price, reason)` if stop/take fires this bar.
+
+        Gap handling: if the bar opens past the stop or take, we
+        cannot realistically fill at the trigger price. Instead the
+        fill is the worse of `open_price` and the trigger:
+
+          - long stop: `min(open, stop)` (we sell at whichever is
+            lower, i.e. worse for us).
+          - long take: `max(open, take)` (we sell at whichever is
+            higher, i.e. better; the gap goes our way).
+          - short stop: `max(open, stop)`.
+          - short take: `min(open, take)`.
+
+        This eliminates the 'gap through stop, still fill at stop'
+        bias that overstates PnL on volatile bars.
+        """
         if self.direction == "long":
             # Conservative: if both could fire, the stop wins.
             if self.stop is not None and low <= self.stop:
-                return (float(self.stop), "stop")
+                exit_price = min(float(open_price), float(self.stop))
+                return (exit_price, "stop")
             if self.take is not None and high >= self.take:
-                return (float(self.take), "take")
+                exit_price = max(float(open_price), float(self.take))
+                return (exit_price, "take")
         else:
             if self.stop is not None and high >= self.stop:
-                return (float(self.stop), "stop")
+                exit_price = max(float(open_price), float(self.stop))
+                return (exit_price, "stop")
             if self.take is not None and low <= self.take:
-                return (float(self.take), "take")
+                exit_price = min(float(open_price), float(self.take))
+                return (exit_price, "take")
         return None
 
     def unrealised(self, mark_price: float) -> float:
@@ -515,9 +541,19 @@ def _validate_frame(df: pd.DataFrame) -> None:
 def _infer_periods_per_year(index: pd.Index) -> float:
     """Best-effort guess at the annualisation factor.
 
-    Looks at the median bar spacing and maps to common defaults
-    (hourly, daily, minutely). Falls back to 252 (daily) when the
-    index is not a DatetimeIndex.
+    Matches the conventions documented in `BacktestConfig`:
+
+      - minutely  -> 525600  (24 * 60 * 365)
+      - hourly    -> 8760    (24 * 365)
+      - 4-hour    -> 2190
+      - daily     -> 252     (trading days)
+      - weekly    -> 52
+      - monthly   -> 12
+
+    Falls back to a calendar-seconds calculation for unusual bar
+    sizes, and to 252 when the index is not a DatetimeIndex. The
+    explicit map avoids the +20% Sharpe inflation that pure
+    calendar scaling produces on daily bars (365 vs 252).
     """
     if not isinstance(index, pd.DatetimeIndex) or len(index) < 2:
         return 252.0
@@ -527,7 +563,22 @@ def _infer_periods_per_year(index: pd.Index) -> float:
     median_seconds = float(diffs.median().total_seconds())
     if median_seconds <= 0:
         return 252.0
-    # Bars per year, treating a year as 365.25 days.
+
+    # Tolerance: within 5% of the canonical spacing maps to the
+    # canonical annualisation factor.
+    canonical = (
+        (60.0, 525600.0),          # minute
+        (3600.0, 8760.0),          # hour
+        (4 * 3600.0, 2190.0),      # 4-hour
+        (86400.0, 252.0),          # day (trading-day convention)
+        (7 * 86400.0, 52.0),       # week
+        (30 * 86400.0, 12.0),      # month
+    )
+    for spacing, factor in canonical:
+        if abs(median_seconds - spacing) / spacing <= 0.05:
+            return factor
+
+    # Unusual bar size: fall back to calendar seconds.
     return (365.25 * 24 * 3600.0) / median_seconds
 
 

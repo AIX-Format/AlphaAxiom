@@ -665,6 +665,190 @@ def test_win_rate_uses_net_pnl_not_gross() -> None:
     assert m.avg_loss == pytest.approx(9.05, rel=1e-9)
 
 
+# ---------------------------------------------------------------------------
+# Gap-through stop handling
+# ---------------------------------------------------------------------------
+
+
+def test_long_stop_with_gap_fills_at_open_not_stop() -> None:
+    """If a bar opens below a long's stop, the fill is the open
+    (worse than the stop), not the stop level. Reverting to the stop
+    price would overstate PnL in volatile markets where overnight
+    gaps regularly punch through resting stops.
+    """
+    # Long entry near 100, stop at 95. Then a violent gap-down bar
+    # that opens at 88 and ranges from 85 to 89.
+    closes = [100.0] * 8 + [99.0, 88.0, 87.0]
+    # We need to engineer the gap-down bar manually since
+    # _build_frame derives highs/lows from the close move; build a
+    # custom frame.
+    n = len(closes)
+    idx = pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC")
+    opens = [100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0,
+             100.0, 88.0, 87.0]  # gap-down on bar 9
+    highs = [100.5, 100.5, 100.5, 100.5, 100.5, 100.5, 100.5, 100.5,
+             99.5, 89.0, 88.0]
+    lows = [99.5, 99.5, 99.5, 99.5, 99.5, 99.5, 99.5, 99.5,
+            98.5, 85.0, 86.0]
+    df = pd.DataFrame(
+        {"open": opens, "high": highs, "low": lows, "close": closes,
+         "volume": [100.0] * n},
+        index=idx,
+    )
+    bt = Backtest(
+        strategy=_OneShotLong("BTC/USDT", stop=95.0, take=200.0),
+        commission=FlatCommission(rate=0.0),
+        slippage=FixedSlippage(bps=0.0),
+        config=BacktestConfig(initial_equity=10_000.0, warmup_bars=2),
+    )
+    result = bt.run(df)
+    stop_trades = [t for t in result.trades if t.exit_reason == "stop"]
+    assert stop_trades, "expected a stop exit on the gap bar"
+    # Fill is the bar open (88.0), not the stop level (95.0).
+    assert stop_trades[0].exit_price == pytest.approx(88.0)
+
+
+def test_short_stop_with_gap_up_fills_at_open() -> None:
+    """Mirror of the long-stop gap case: a short's stop is set above
+    entry; a violent gap-up bar that opens above the stop fills at
+    the open, not the stop.
+    """
+    # The strategies module does not ship a one-shot short; reuse
+    # the long one inverted is awkward, so define a tiny stub here.
+    class _OneShotShort(Strategy):
+        name = "one-shot-short"
+
+        def __init__(self, symbol: str, *, stop: float, take: float) -> None:
+            super().__init__(symbol)
+            self._fired = False
+            self._stop = stop
+            self._take = take
+
+        def generate_signal(self, df: pd.DataFrame) -> TradingSignal:
+            last_close = float(df["close"].iloc[-1])
+            if self._fired:
+                return TradingSignal(
+                    symbol=self.symbol, action="HOLD", confidence=0.0,
+                    strategy=self.name,
+                )
+            self._fired = True
+            return TradingSignal(
+                symbol=self.symbol,
+                action="SELL",
+                confidence=0.8,
+                strategy=self.name,
+                entry_price=last_close,
+                stop_loss=self._stop,
+                take_profit=self._take,
+            )
+
+    n = 11
+    idx = pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC")
+    closes = [100.0] * 8 + [101.0, 112.0, 113.0]
+    opens = [100.0] * 9 + [112.0, 113.0]
+    highs = [100.5] * 8 + [101.5, 115.0, 114.0]
+    lows = [99.5] * 8 + [100.5, 111.0, 112.0]
+    df = pd.DataFrame(
+        {"open": opens, "high": highs, "low": lows, "close": closes,
+         "volume": [100.0] * n},
+        index=idx,
+    )
+    bt = Backtest(
+        strategy=_OneShotShort("BTC/USDT", stop=105.0, take=80.0),
+        commission=FlatCommission(rate=0.0),
+        slippage=FixedSlippage(bps=0.0),
+        config=BacktestConfig(initial_equity=10_000.0, warmup_bars=2),
+    )
+    result = bt.run(df)
+    stop_trades = [t for t in result.trades if t.exit_reason == "stop"]
+    assert stop_trades
+    # Fill is the gap-up open (112.0), not the stop level (105.0).
+    assert stop_trades[0].exit_price == pytest.approx(112.0)
+
+
+# ---------------------------------------------------------------------------
+# Annualisation factor mapping
+# ---------------------------------------------------------------------------
+
+
+def test_periods_per_year_for_hourly_bars_uses_8760() -> None:
+    from engine.backtest import _infer_periods_per_year
+    idx = pd.date_range("2024-01-01", periods=100, freq="h", tz="UTC")
+    assert _infer_periods_per_year(idx) == 8760.0
+
+
+def test_periods_per_year_for_daily_bars_uses_252() -> None:
+    from engine.backtest import _infer_periods_per_year
+    idx = pd.date_range("2024-01-01", periods=100, freq="D", tz="UTC")
+    assert _infer_periods_per_year(idx) == 252.0
+
+
+def test_periods_per_year_for_minutely_bars_uses_525600() -> None:
+    from engine.backtest import _infer_periods_per_year
+    idx = pd.date_range("2024-01-01", periods=100, freq="min", tz="UTC")
+    assert _infer_periods_per_year(idx) == 525600.0
+
+
+def test_periods_per_year_falls_back_for_unusual_spacing() -> None:
+    from engine.backtest import _infer_periods_per_year
+    # 17-second bars: no canonical mapping, fall back to calendar.
+    idx = pd.date_range("2024-01-01", periods=20, freq="17s", tz="UTC")
+    out = _infer_periods_per_year(idx)
+    # Calendar approx: 365.25 * 24 * 3600 / 17 ~= 1_855_976
+    assert out == pytest.approx(365.25 * 24 * 3600.0 / 17.0, rel=0.01)
+
+
+# ---------------------------------------------------------------------------
+# ATR look-ahead bias regression
+# ---------------------------------------------------------------------------
+
+
+def test_atr_for_entry_fill_uses_bar_t_not_bar_t_plus_one() -> None:
+    """ATR(t+1) depends on bar t+1's own high/low/close which is not
+    knowable at the open. The engine must pass ATR(t) instead.
+    Verify by stuffing a known low-ATR-then-spike-ATR pattern into
+    the frame and asserting the slippage spy receives the calmer
+    ATR(t), not the spike from bar t+1.
+    """
+    n = 60
+    idx = pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC")
+    # Quiet for 30 bars, then a single huge range bar at the entry
+    # bar, then quiet again.
+    closes = [100.0] * n
+    opens = [100.0] * n
+    highs = [100.1] * n
+    lows = [99.9] * n
+    # Make bar 31 (the entry bar) extremely wide.
+    highs[31] = 120.0
+    lows[31] = 80.0
+    df = pd.DataFrame(
+        {"open": opens, "high": highs, "low": lows, "close": closes,
+         "volume": [100.0] * n},
+        index=idx,
+    )
+
+    spy = _RecordingSlippage()
+    # Strategy fires on bar 30 (warmup=20), entry on bar 31.
+    bt = Backtest(
+        strategy=_OneShotLong("BTC/USDT", stop=80.0, take=200.0),
+        commission=FlatCommission(rate=0.0),
+        slippage=spy,
+        config=BacktestConfig(initial_equity=10_000.0, warmup_bars=20),
+    )
+    bt.run(df)
+
+    # First spy call is the entry fill at bar 31's open. The ATR it
+    # received should be ATR(30), which was computed from the calm
+    # period and is therefore small. ATR(31) would be inflated by
+    # the wide bar.
+    assert spy.calls, "slippage was never invoked"
+    _, _, entry_atr = spy.calls[0]
+    assert entry_atr is not None
+    # Calm ATR is on the order of 0.2; the wide bar's contribution
+    # would push ATR(31) into the single digits.
+    assert entry_atr < 1.0, f"entry ATR {entry_atr} looks like ATR(t+1)"
+
+
 def test_atr_is_passed_to_slippage_model() -> None:
     """AtrSlippage was always falling back to its floor because the
     engine never passed an ATR value. Verify the engine forwards a
