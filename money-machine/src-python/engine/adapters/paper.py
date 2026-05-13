@@ -79,10 +79,23 @@ class PaperAdapter(ExecutionAdapter):
     # ------------------------------------------------------------------
 
     def set_mark_price(self, symbol: str, price: float) -> None:
-        """Update the mark used for fills on `symbol`."""
-        if price <= 0:
-            raise AdapterError(f"mark price must be > 0, got {price!r}")
-        self._mark_prices[symbol] = float(price)
+        """Update the mark used for fills on `symbol`.
+
+        Rejects non-finite values (NaN/inf) explicitly: those would
+        propagate straight into quantity/notional math on the next
+        fill and silently corrupt balance and positions.
+        """
+        try:
+            value = float(price)
+        except (TypeError, ValueError) as exc:
+            raise AdapterError(f"mark price must be a number, got {price!r}") from exc
+        import math
+
+        if not math.isfinite(value) or value <= 0:
+            raise AdapterError(
+                f"mark price must be a finite positive number, got {price!r}"
+            )
+        self._mark_prices[symbol] = value
 
     async def process_open_orders(self) -> List[OrderResult]:
         """Re-evaluate every PENDING limit order against current marks.
@@ -217,12 +230,20 @@ class PaperAdapter(ExecutionAdapter):
     ) -> OrderResult:
         # Limit orders fill at the better of the limit price and the
         # current mark, then have slippage applied on the worse side.
+        # The fill price is then clamped back to the limit so a noisy
+        # slippage model cannot push a BUY above its limit (or a SELL
+        # below): a limit order is a strict price cap by definition.
+        limit = float(request.limit_price)
         if request.side is OrderSide.BUY:
-            base_price = min(float(request.limit_price), mark)
+            base_price = min(limit, mark)
         else:
-            base_price = max(float(request.limit_price), mark)
+            base_price = max(limit, mark)
         side_str = "buy" if request.side is OrderSide.BUY else "sell"
-        fill_price = self.slippage.apply(base_price, side_str)
+        slipped = self.slippage.apply(base_price, side_str)
+        if request.side is OrderSide.BUY:
+            fill_price = min(slipped, limit)
+        else:
+            fill_price = max(slipped, limit)
         return self._record_fill_locked(request, fill_price)
 
     def _record_fill_locked(
@@ -240,6 +261,16 @@ class PaperAdapter(ExecutionAdapter):
         if request.side is OrderSide.BUY:
             cash_change = -(notional + commission)
             position_change = qty
+            # Spot-style guardrail: a paper BUY that cannot be funded
+            # is rejected the same way a real exchange would reject
+            # it. Without this the balance would silently go
+            # negative and downstream risk calculations would lie.
+            required = notional + commission
+            if required > self._balance:
+                return self._reject(
+                    request,
+                    f"insufficient balance: need {required:.2f}, have {self._balance:.2f}",
+                )
         else:
             cash_change = notional - commission
             position_change = -qty

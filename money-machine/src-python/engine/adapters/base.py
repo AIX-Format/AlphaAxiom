@@ -199,11 +199,15 @@ class ExecutionAdapter(abc.ABC):
 
         Centralised so every concrete adapter applies the same first-
         line sanity checks before talking to the venue: a non-empty
-        client_order_id, a known side and type, a positive quantity or
-        notional, finite numbers in the price fields.
+        client_order_id and symbol, a known side and type, exactly
+        one of `quantity` or `notional` (rejecting both being set
+        eliminates the silent-priority ambiguity between adapters),
+        and finite numbers in the price fields.
         """
         if not request.client_order_id:
             return "client_order_id is required"
+        if not request.symbol or not request.symbol.strip():
+            return "symbol is required"
         if not isinstance(request.side, OrderSide):
             return f"side must be an OrderSide enum, got {type(request.side).__name__}"
         if not isinstance(request.order_type, OrderType):
@@ -216,6 +220,12 @@ class ExecutionAdapter(abc.ABC):
         )
         if size_given == 0:
             return "either quantity or notional must be set"
+        if size_given > 1:
+            # Forbid both: PaperAdapter would silently prefer
+            # quantity, EVMAdapter would do something else, and the
+            # ambiguity is exactly the kind of bug that takes weeks
+            # to track down.
+            return "set exactly one of quantity or notional, not both"
         if request.quantity is not None and not _is_positive(request.quantity):
             return f"quantity must be a positive finite number, got {request.quantity!r}"
         if request.notional is not None and not _is_positive(request.notional):

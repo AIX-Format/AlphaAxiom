@@ -58,9 +58,14 @@ def _market_buy(
     client_id: str,
     *,
     symbol: str = "BTC/USDT",
-    notional: Optional[float] = 1_000.0,
+    notional: Optional[float] = None,
     quantity: Optional[float] = None,
 ) -> OrderRequest:
+    # Default to notional=1000 only when both are unset, so callers
+    # that supply `quantity=` get exactly one size field set (and
+    # pass the validator's XOR check).
+    if notional is None and quantity is None:
+        notional = 1_000.0
     return OrderRequest(
         client_order_id=client_id,
         symbol=symbol,
@@ -94,6 +99,44 @@ def _market_sell(
 def test_validate_request_accepts_well_formed_market_order() -> None:
     req = _market_buy("abc")
     assert ExecutionAdapter._validate_request(req) is None
+
+
+def test_validate_request_rejects_empty_symbol() -> None:
+    req = OrderRequest(
+        client_order_id="x",
+        symbol="",  # empty
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        notional=1_000.0,
+    )
+    err = ExecutionAdapter._validate_request(req)
+    assert err is not None and "symbol" in err
+
+
+def test_validate_request_rejects_whitespace_symbol() -> None:
+    req = OrderRequest(
+        client_order_id="x",
+        symbol="   ",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        notional=1_000.0,
+    )
+    err = ExecutionAdapter._validate_request(req)
+    assert err is not None and "symbol" in err
+
+
+def test_validate_request_rejects_both_quantity_and_notional() -> None:
+    """Setting BOTH creates ambiguous semantics; callers must pick one."""
+    req = OrderRequest(
+        client_order_id="x",
+        symbol="BTC/USDT",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        notional=1_000.0,
+        quantity=0.02,
+    )
+    err = ExecutionAdapter._validate_request(req)
+    assert err is not None and "exactly one" in err
 
 
 @pytest.mark.parametrize(
@@ -419,3 +462,90 @@ def test_set_mark_price_rejects_non_positive() -> None:
         adapter.set_mark_price("BTC/USDT", 0.0)
     with pytest.raises(AdapterError):
         adapter.set_mark_price("BTC/USDT", -5.0)
+
+
+def test_set_mark_price_rejects_nan_and_inf() -> None:
+    adapter = PaperAdapter(initial_balance=10_000.0)
+    with pytest.raises(AdapterError):
+        adapter.set_mark_price("BTC/USDT", float("nan"))
+    with pytest.raises(AdapterError):
+        adapter.set_mark_price("BTC/USDT", float("inf"))
+    with pytest.raises(AdapterError):
+        adapter.set_mark_price("BTC/USDT", float("-inf"))
+
+
+def test_paper_adapter_rejects_buy_when_insufficient_balance() -> None:
+    """A spot-style BUY that cannot be funded must be rejected the
+    same way a real exchange rejects it. Otherwise the balance
+    silently goes negative and downstream risk math lies.
+    """
+    async def scenario() -> None:
+        adapter = PaperAdapter(initial_balance=100.0)
+        adapter.set_mark_price("BTC/USDT", 50_000.0)
+        result = await adapter.place_order(
+            _market_buy("oversize", notional=10_000.0)
+        )
+        assert result.status is OrderStatus.REJECTED
+        assert "insufficient balance" in (result.error or "")
+        # Balance untouched.
+        assert (await adapter.get_balance()) == pytest.approx(100.0)
+        # No position opened.
+        assert (await adapter.get_positions()) == {}
+
+    _run(scenario())
+
+
+def test_limit_buy_fill_clamped_to_limit_price_after_slippage() -> None:
+    """A BUY limit fill must never go above the limit price, even when
+    the slippage model would push it higher. The limit is a strict
+    cap by definition.
+    """
+    async def scenario() -> None:
+        adapter = PaperAdapter(
+            initial_balance=10_000.0,
+            commission=FlatCommission(rate=0.0),
+            slippage=FixedSlippage(bps=100.0),  # 1% upward push on buys
+        )
+        adapter.set_mark_price("BTC/USDT", 100.0)
+        # Limit BUY at 100; mark is 100 so the limit can fill. The
+        # slippage model would push the fill to 101, but the clamp
+        # holds it at 100.
+        req = OrderRequest(
+            client_order_id="lim",
+            symbol="BTC/USDT",
+            side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            quantity=1.0,
+            limit_price=100.0,
+        )
+        result = await adapter.place_order(req)
+        assert result.status is OrderStatus.FILLED
+        assert result.average_fill_price == pytest.approx(100.0)
+
+    _run(scenario())
+
+
+def test_limit_sell_fill_clamped_to_limit_price_after_slippage() -> None:
+    async def scenario() -> None:
+        adapter = PaperAdapter(
+            initial_balance=10_000.0,
+            commission=FlatCommission(rate=0.0),
+            slippage=FixedSlippage(bps=100.0),
+        )
+        adapter.set_mark_price("BTC/USDT", 100.0)
+        # Seed a position to sell.
+        adapter._positions["BTC/USDT"] = 1.0  # type: ignore[attr-defined]
+        req = OrderRequest(
+            client_order_id="lim-s",
+            symbol="BTC/USDT",
+            side=OrderSide.SELL,
+            order_type=OrderType.LIMIT,
+            quantity=1.0,
+            limit_price=100.0,
+        )
+        result = await adapter.place_order(req)
+        assert result.status is OrderStatus.FILLED
+        # Slippage would push the sell fill DOWN to 99; clamp keeps it at 100.
+        assert result.average_fill_price == pytest.approx(100.0)
+
+    _run(scenario())
