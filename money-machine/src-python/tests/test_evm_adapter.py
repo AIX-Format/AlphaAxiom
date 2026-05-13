@@ -615,3 +615,65 @@ def test_cancel_unknown_returns_rejected() -> None:
         assert result.status is OrderStatus.REJECTED
 
     _run(scenario())
+
+
+def test_place_order_rpc_timeout_is_rejected_and_reason_is_logged() -> None:
+    async def scenario() -> None:
+        async def timeout_rpc(method: str, params: List[Any]) -> Any:
+            if method == "eth_sendRawTransaction":
+                raise TimeoutError("rpc timeout")
+            if method == "eth_getTransactionCount":
+                return "0x0"
+            if method == "eth_gasPrice":
+                return "0x1"
+            return None
+
+        adapter = EVMAdapter(rpc=timeout_rpc, private_key=PRIVATE_KEY, account_address=ACCOUNT)
+        result = await adapter.place_order(_request("evm-timeout"))
+        assert result.status is OrderStatus.REJECTED
+        assert "timeout" in (result.error or "")
+
+    _run(scenario())
+
+
+def test_wait_for_receipt_timeout_threshold_and_poll_backoff() -> None:
+    """Polling should respect confirm timeout and bounded poll cadence."""
+    async def scenario() -> None:
+        rpc = _FakeRpc({
+            "eth_getTransactionCount": "0x0",
+            "eth_gasPrice": "0x1",
+            "eth_sendRawTransaction": "0xtxhash",
+            "eth_getTransactionReceipt": [None, None, None],
+        })
+
+        now = [0.0]
+        def fake_clock() -> float:
+            now[0] += 0.11
+            return now[0]
+
+        adapter = EVMAdapter(
+            rpc=rpc,
+            private_key=PRIVATE_KEY,
+            account_address=ACCOUNT,
+            clock=fake_clock,
+            config=EVMAdapterConfig(confirm_timeout_seconds=0.3, confirm_poll_seconds=0.05),
+        )
+        await adapter.place_order(_request("ord-timeout"))
+
+        sleeps = []
+        original_sleep = asyncio.sleep
+        async def capture_sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        asyncio.sleep = capture_sleep  # type: ignore[assignment]
+        try:
+            receipt = await adapter.wait_for_receipt("ord-timeout")
+        finally:
+            asyncio.sleep = original_sleep  # type: ignore[assignment]
+
+        assert receipt is None
+        cached = adapter._order_cache["ord-timeout"]
+        assert cached.status is OrderStatus.PENDING
+        assert sleeps and all(d <= 0.05 for d in sleeps)
+
+    _run(scenario())

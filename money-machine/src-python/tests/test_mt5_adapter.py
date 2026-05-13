@@ -553,8 +553,8 @@ def test_response_non_dict_body_does_not_crash() -> None:
         http = _FakeHttp([HttpResponse(status=202, body=b'["unexpected"]', headers={})])
         adapter = MT5Adapter(http_client=http, signer=_signer())
         result = await adapter.place_order(_request("ord-list"))
-        assert result.status is OrderStatus.PENDING
-        assert result.venue_order_id is None
+        assert result.status is OrderStatus.REJECTED
+        assert "venue_order_id" in (result.error or "")
 
     _run(scenario())
 
@@ -896,3 +896,83 @@ def test_keychain_signer_raises_when_key_missing(monkeypatch) -> None:
     signer = mt5_module.keychain_signer()
     with pytest.raises(AdapterError):
         signer(b"anything")
+
+
+def test_place_order_timeout_is_fail_closed_and_not_cached() -> None:
+    """Transport timeout should produce REJECTED, log clear reason, and
+    avoid caching so a later retry can still submit once connectivity
+    recovers.
+    """
+    async def scenario() -> None:
+        calls = [0]
+
+        async def flaky_http(_m, _u, _h, _b):
+            calls[0] += 1
+            if calls[0] == 1:
+                raise TimeoutError("relay timed out")
+            return HttpResponse(status=202, body=b'{"venue_order_id":"v-after-timeout"}', headers={})
+
+        adapter = MT5Adapter(
+            http_client=flaky_http,
+            signer=_signer(),
+            config=MT5Config(max_retries=0),
+        )
+
+        first = await adapter.place_order(_request("ord-timeout"))
+        assert first.status is OrderStatus.REJECTED
+        assert "timeout" in (first.error or "")
+
+        second = await adapter.place_order(_request("ord-timeout"))
+        assert second.status is OrderStatus.REJECTED
+        # Fail-closed idempotency: no duplicate relay command after timeout.
+        assert calls[0] == 1
+
+    _run(scenario())
+
+
+def test_place_order_invalid_success_payload_is_rejected_fail_closed() -> None:
+    """If relay returns 202 without a usable venue_order_id, adapter must
+    fail closed instead of accepting ambiguous state.
+    """
+    async def scenario() -> None:
+        http = _FakeHttp([HttpResponse(status=202, body=b'{"ok":true}', headers={})])
+        adapter = MT5Adapter(http_client=http, signer=_signer())
+        result = await adapter.place_order(_request("ord-bad-ack"))
+        assert result.status is OrderStatus.REJECTED
+        assert "venue_order_id" in (result.error or "")
+        assert len(http.calls) == 1
+
+    _run(scenario())
+
+
+def test_retry_backoff_delays_are_bounded_for_mt5() -> None:
+    """Retry loop should sleep with bounded backoff, not unbounded delays."""
+    async def scenario() -> None:
+        http = _FakeHttp([
+            HttpResponse(status=503, body=b"busy", headers={}),
+            HttpResponse(status=503, body=b"still busy", headers={}),
+            HttpResponse(status=202, body=b'{"venue_order_id":"v-ok"}', headers={}),
+        ])
+        adapter = MT5Adapter(
+            http_client=http,
+            signer=_signer(),
+            config=MT5Config(max_retries=3, backoff_base_seconds=0.1, backoff_max_seconds=0.2),
+        )
+
+        observed = []
+        original_sleep = asyncio.sleep
+
+        async def capture_sleep(delay: float) -> None:
+            observed.append(delay)
+
+        asyncio.sleep = capture_sleep  # type: ignore[assignment]
+        try:
+            result = await adapter.place_order(_request("ord-backoff"))
+        finally:
+            asyncio.sleep = original_sleep  # type: ignore[assignment]
+
+        assert result.status is OrderStatus.PENDING
+        assert len(observed) == 2
+        assert all(0.0 <= d <= 0.22 for d in observed)
+
+    _run(scenario())
