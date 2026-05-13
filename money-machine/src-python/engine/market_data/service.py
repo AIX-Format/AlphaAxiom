@@ -89,6 +89,16 @@ class MarketDataService:
         if end_ms <= start_ms:
             return self._empty_frame()
 
+        interval_ms = INTERVAL_MS.get(interval)
+        if interval_ms is None:
+            # Fail loudly here, matching what BinancePublicClient
+            # does on its own. Silently passing None to
+            # _missing_ranges would let an unknown interval slip
+            # through when the cache happened to be complete.
+            raise ValueError(
+                f"unknown interval {interval!r}. Known: {sorted(INTERVAL_MS)}"
+            )
+
         key = (
             symbol.replace("/", "").replace(":", "_").upper(),
             interval,
@@ -96,7 +106,6 @@ class MarketDataService:
         lock = self._cache_locks.setdefault(key, asyncio.Lock())
         async with lock:
             cached = self._load_cache(symbol, interval)
-            interval_ms = INTERVAL_MS.get(interval)
             missing = self._missing_ranges(cached, start_ms, end_ms, interval_ms)
             if missing:
                 new_rows: List[Candle] = []
@@ -160,7 +169,9 @@ class MarketDataService:
                 "Falling back to empty cache; backfill will repopulate.",
                 path, exc,
             )
-            return pd.DataFrame(columns=list(CANONICAL_COLUMNS))
+            return pd.DataFrame(columns=list(CANONICAL_COLUMNS)).astype(
+                {"open_time_ms": "int64"}
+            )
         # Hardening: keep only the columns we control. Use
         # pd.to_numeric(errors="coerce") to turn any residual junk
         # into NaN before dropping, instead of letting .astype crash.

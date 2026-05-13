@@ -8,7 +8,7 @@ import them without dragging in `aiohttp` / `requests`.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Protocol
+from typing import Dict, List, Protocol
 
 
 #: Canonical interval-code-to-milliseconds map. Shared by both the
@@ -58,7 +58,7 @@ class MarketDataClient(Protocol):
         interval: str,
         start_ms: int,
         end_ms: int,
-    ) -> list:
+    ) -> List[Candle]:
         """Return a list of `Candle` between `start_ms` (inclusive)
         and `end_ms` (exclusive), in chronological order. The
         implementation is responsible for paging if the venue caps

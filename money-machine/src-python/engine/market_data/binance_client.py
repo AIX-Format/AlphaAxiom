@@ -38,6 +38,32 @@ class BinancePublicConfig:
     backoff_base_seconds: float = 0.5
     backoff_max_seconds: float = 8.0
 
+    def __post_init__(self) -> None:
+        # Binance public klines tops out at 1000 per request; values
+        # above that are silently truncated by the venue, which
+        # corrupts paging cursors. Sub-zero values would break the
+        # loop entirely.
+        if not 1 <= self.max_per_request <= 1000:
+            raise ValueError(
+                f"max_per_request must be in [1, 1000], got {self.max_per_request!r}"
+            )
+        if self.request_timeout_seconds <= 0:
+            raise ValueError(
+                f"request_timeout_seconds must be > 0, got {self.request_timeout_seconds!r}"
+            )
+        if self.max_retries < 0:
+            raise ValueError(
+                f"max_retries must be >= 0, got {self.max_retries!r}"
+            )
+        if self.backoff_base_seconds < 0 or self.backoff_max_seconds < 0:
+            raise ValueError("backoff values must be >= 0")
+        if self.backoff_base_seconds > self.backoff_max_seconds:
+            raise ValueError(
+                "backoff_base_seconds cannot exceed backoff_max_seconds"
+            )
+        if not isinstance(self.base_url, str) or not self.base_url.strip():
+            raise ValueError("base_url must be a non-empty string")
+
 
 class BinancePublicClient:
     """Calls `/api/v3/klines` with paged backfill."""

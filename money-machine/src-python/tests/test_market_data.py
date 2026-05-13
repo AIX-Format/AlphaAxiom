@@ -87,7 +87,9 @@ class _FakeHttpFetch:
     async def __call__(self, url: str, params: Dict[str, Any]) -> bytes:
         self.calls.append((url, dict(params)))
         if not self._responses:
-            return b"[]"
+            raise AssertionError(
+                f"Unexpected extra HTTP fetch call: url={url} params={params}"
+            )
         return self._responses.pop(0)
 
 
@@ -210,6 +212,37 @@ def test_binance_client_retries_on_transport_error() -> None:
     _run(scenario())
 
 
+def test_binance_public_config_rejects_invalid_values() -> None:
+    from engine.market_data.binance_client import BinancePublicConfig
+
+    with pytest.raises(ValueError):
+        BinancePublicConfig(max_per_request=0)
+    with pytest.raises(ValueError):
+        BinancePublicConfig(max_per_request=5000)  # Binance caps at 1000
+    with pytest.raises(ValueError):
+        BinancePublicConfig(request_timeout_seconds=0.0)
+    with pytest.raises(ValueError):
+        BinancePublicConfig(max_retries=-1)
+    with pytest.raises(ValueError):
+        BinancePublicConfig(backoff_base_seconds=10.0, backoff_max_seconds=1.0)
+    with pytest.raises(ValueError):
+        BinancePublicConfig(base_url="")
+
+
+def test_service_rejects_unknown_interval_in_get_ohlcv(tmp_path: Path) -> None:
+    """Even when the cache happens to be complete, an unknown
+    interval must fail fast rather than slip through with a 1ms
+    granularity fallback in `_missing_ranges`.
+    """
+    async def scenario() -> None:
+        client = _StubClient(_candles(0, 5))
+        svc = MarketDataService(client=client, cache_dir=tmp_path)
+        with pytest.raises(ValueError):
+            await svc.get_ohlcv("BTC/USDT", "37s", 0, 5 * HOUR_MS)
+
+    _run(scenario())
+
+
 def test_binance_client_rejects_unknown_interval() -> None:
     async def scenario() -> None:
         client = BinancePublicClient(http_fetch=_FakeHttpFetch([]))
@@ -276,7 +309,7 @@ def test_service_cold_cache_calls_upstream_and_writes_csv(tmp_path: Path) -> Non
 
         assert list(df.columns) == ["open", "high", "low", "close", "volume"]
         assert len(df) == 5
-        assert df.index.tz is not None  # UTC indexed
+        assert str(df.index.tz) == "UTC"
         # Upstream was called exactly once with the full range.
         assert len(client.calls) == 1
         assert client.calls[0] == ("BTC/USDT", "1h", 0, 5 * HOUR_MS)
@@ -317,7 +350,9 @@ def test_service_fetches_only_missing_tail_segment(tmp_path: Path) -> None:
         # gap from open_time 3*HOUR_MS to 6*HOUR_MS.
         assert len(client.calls) == 1
         _, _, gap_start, gap_end = client.calls[0]
-        assert gap_start >= 3 * HOUR_MS
+        # Strict equality: any overlap with the cached range means we
+        # over-fetched and the gap-detection regressed.
+        assert gap_start == 3 * HOUR_MS
         assert gap_end == 6 * HOUR_MS
 
     _run(scenario())
@@ -443,5 +478,6 @@ def test_service_output_feeds_backtest_engine(tmp_path: Path) -> None:
         # HOLD-only strategy: no trades, flat equity, no NaN anywhere.
         assert result.metrics.num_trades == 0
         assert (result.equity_curve == 10_000.0).all()
+        assert result.equity_curve.notna().all()
 
     _run(scenario())
