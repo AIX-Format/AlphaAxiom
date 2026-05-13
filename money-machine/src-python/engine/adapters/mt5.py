@@ -52,6 +52,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from ..contracts import SignedOrderContract
 from .base import (
     AdapterError,
     ExecutionAdapter,
