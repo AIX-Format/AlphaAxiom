@@ -44,6 +44,7 @@ from typing import Any, Callable, Dict, List, Optional, Protocol
 import numpy as np
 import pandas as pd
 
+from .indicators import atr as _atr_series
 from .strategies.base import REQUIRED_COLUMNS, Strategy, TradingSignal
 
 
@@ -251,14 +252,41 @@ class Backtest:
         closes = df["close"].to_numpy(dtype=float)
         index = df.index
 
+        # Precompute ATR once so AtrSlippage actually sees volatility
+        # instead of always falling back to its floor. The 14-bar
+        # default lines up with what the strategies use for their own
+        # stops, so the slippage model and the strategy share a
+        # consistent volatility view.
+        try:
+            atr_values = _atr_series(
+                df["high"], df["low"], df["close"], period=14
+            ).to_numpy(dtype=float)
+        except Exception:
+            atr_values = np.full(n, np.nan, dtype=float)
+
+        def _bar_atr(i: int) -> Optional[float]:
+            if i < 0 or i >= n:
+                return None
+            v = atr_values[i]
+            return float(v) if math.isfinite(v) else None
+
         for t in range(n):
             # 1) Mark-to-market any open position at this bar's close.
             #    Also check whether stop/take fired intra-bar.
             if position is not None:
                 exit_info = position.check_intrabar(highs[t], lows[t])
                 if exit_info is not None:
-                    exit_price, reason = exit_info
-                    realised = position.close(exit_price, index[t], reason, self.commission)
+                    trigger_price, reason = exit_info
+                    # Stop/take fills experience slippage just like any
+                    # other order. Longs sell to exit (slip down); shorts
+                    # buy to exit (slip up).
+                    exit_side = "sell" if position.direction == "long" else "buy"
+                    exit_price = self.slippage.apply(
+                        trigger_price, exit_side, atr=_bar_atr(t)
+                    )
+                    realised = position.close(
+                        exit_price, index[t], reason, self.commission
+                    )
                     equity += realised
                     trades.append(position.record)
                     position = None
@@ -286,6 +314,8 @@ class Backtest:
             if not signal.is_actionable():
                 continue
 
+            next_atr = _bar_atr(t + 1)
+
             # 4) Apply the signal on the NEXT bar's open. If we have an
             #    open position in the opposite direction, close it first.
             if position is not None and not _same_direction(position, signal):
@@ -293,6 +323,7 @@ class Backtest:
                 slipped = self.slippage.apply(
                     close_open,
                     "sell" if position.direction == "long" else "buy",
+                    atr=next_atr,
                 )
                 realised = position.close(
                     slipped, index[t + 1], "signal_flip", self.commission
@@ -304,12 +335,14 @@ class Backtest:
             # If after the close we are flat, open a fresh position.
             if position is None:
                 size_notional = self._compute_size(signal, equity)
-                if size_notional <= 0:
+                if size_notional <= 0 or not math.isfinite(size_notional):
                     continue
                 fill_side = "buy" if signal.action == "BUY" else "sell"
-                fill_price = self.slippage.apply(opens[t + 1], fill_side)
+                fill_price = self.slippage.apply(
+                    opens[t + 1], fill_side, atr=next_atr
+                )
                 qty = size_notional / fill_price if fill_price > 0 else 0.0
-                if qty <= 0:
+                if qty <= 0 or not math.isfinite(qty):
                     continue
                 entry_commission = self.commission.apply(size_notional)
                 equity -= entry_commission
@@ -325,8 +358,13 @@ class Backtest:
 
         # 5) Force-close anything still open at the final bar's close.
         if position is not None:
+            final_atr = _bar_atr(n - 1)
+            exit_side = "sell" if position.direction == "long" else "buy"
+            slipped_close = self.slippage.apply(
+                closes[-1], exit_side, atr=final_atr
+            )
             realised = position.close(
-                closes[-1], index[-1], "end_of_data", self.commission
+                slipped_close, index[-1], "end_of_data", self.commission
             )
             equity += realised
             trades.append(position.record)
@@ -343,17 +381,34 @@ class Backtest:
         return BacktestResult(equity_curve=eq_series, trades=trades, metrics=metrics)
 
     def _compute_size(self, signal: TradingSignal, equity: float) -> float:
-        if equity <= 0:
+        # NaN sneaks past plain `<= 0` and `if entry and stop` checks
+        # (NaN is truthy) so we coerce and explicitly reject any
+        # non-finite value. Without this a strategy that emits a
+        # NaN stop would contaminate the equity curve with NaN.
+        if not math.isfinite(equity) or equity <= 0:
             return 0.0
-        entry = signal.entry_price
-        stop = signal.stop_loss
-        if entry and stop and entry > 0:
-            stop_pct = abs(float(entry) - float(stop)) / float(entry)
-            if stop_pct <= 0:
+
+        try:
+            entry = float(signal.entry_price) if signal.entry_price is not None else None
+            stop = float(signal.stop_loss) if signal.stop_loss is not None else None
+        except (TypeError, ValueError):
+            entry, stop = None, None
+
+        if (
+            entry is not None
+            and stop is not None
+            and math.isfinite(entry)
+            and math.isfinite(stop)
+            and entry > 0
+        ):
+            stop_pct = abs(entry - stop) / entry
+            if not math.isfinite(stop_pct) or stop_pct <= 0:
                 stop_pct = self.config.fallback_stop_pct
         else:
             stop_pct = self.config.fallback_stop_pct
-        return equity * self.config.risk_per_trade_pct / stop_pct
+
+        size = equity * self.config.risk_per_trade_pct / stop_pct
+        return size if math.isfinite(size) else 0.0
 
 
 # ---------------------------------------------------------------------------

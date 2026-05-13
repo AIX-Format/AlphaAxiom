@@ -448,3 +448,144 @@ def test_backtest_rejects_frame_missing_columns() -> None:
     df = pd.DataFrame({"close": [1.0, 2.0, 3.0]})
     with pytest.raises(ValueError):
         bt.run(df)
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for Codex P1 findings on the backtest engine.
+# ---------------------------------------------------------------------------
+
+
+class _NaNStopStrategy(Strategy):
+    """Emits one BUY with a NaN stop_loss, then HOLDs."""
+
+    name = "nan-stop-test"
+
+    def __init__(self, symbol: str) -> None:
+        super().__init__(symbol)
+        self._fired = False
+
+    def generate_signal(self, df: pd.DataFrame) -> TradingSignal:
+        if self._fired:
+            return TradingSignal(
+                symbol=self.symbol, action="HOLD", confidence=0.0,
+                strategy=self.name,
+            )
+        self._fired = True
+        last_close = float(df["close"].iloc[-1])
+        return TradingSignal(
+            symbol=self.symbol,
+            action="BUY",
+            confidence=0.9,
+            strategy=self.name,
+            entry_price=last_close,
+            stop_loss=float("nan"),
+            take_profit=last_close * 1.10,
+        )
+
+
+def test_nan_stop_does_not_contaminate_equity_curve() -> None:
+    """A strategy emitting NaN stop_loss must not produce NaN sizing
+    or NaN equity. Without the explicit isfinite guard, NaN
+    propagates through commission and quantity math and silently
+    breaks every downstream metric.
+    """
+    closes = [100.0 + i * 0.5 for i in range(60)]
+    df = _build_frame(closes, atr_pct=0.002)
+    bt = Backtest(
+        strategy=_NaNStopStrategy("BTC/USDT"),
+        config=BacktestConfig(
+            initial_equity=10_000.0,
+            warmup_bars=2,
+            fallback_stop_pct=0.02,
+        ),
+    )
+    result = bt.run(df)
+    # No NaN anywhere in the equity curve.
+    assert not result.equity_curve.isna().any()
+    # Metrics are finite.
+    assert math.isfinite(result.metrics.total_return)
+    assert math.isfinite(result.metrics.sharpe)
+    assert math.isfinite(result.metrics.max_drawdown)
+    # And the fallback stop kicked in so we still traded.
+    assert result.metrics.num_trades >= 1
+
+
+def test_stop_exit_pays_slippage() -> None:
+    """Stop-loss exits must run through the slippage model. Previously
+    they used the raw trigger price, which made stop-heavy strategies
+    look better than they were under nonzero slippage.
+    """
+    # Up trend then sharp dip that fires the stop.
+    closes = [100.0] * 10 + [99.0, 98.0, 90.0, 95.0, 96.0]
+    df = _build_frame(closes, atr_pct=0.002)
+    bt = Backtest(
+        strategy=_OneShotLong("BTC/USDT", stop=95.0, take=200.0),
+        commission=FlatCommission(rate=0.0),
+        slippage=FixedSlippage(bps=100.0),  # 1% slippage, very visible
+        config=BacktestConfig(initial_equity=10_000.0, warmup_bars=2),
+    )
+    result = bt.run(df)
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.exit_reason == "stop"
+    # A long exit is a sell; slippage at 100 bps drags the fill below
+    # the trigger price of 95.0.
+    assert trade.exit_price < 95.0
+    assert trade.exit_price == pytest.approx(95.0 * (1.0 - 0.01))
+
+
+def test_take_exit_pays_slippage() -> None:
+    """Mirror of the stop test: take-profit exits also pay slippage."""
+    closes = [100.0] * 5 + [101.0, 102.0, 103.0, 110.0, 108.0]
+    df = _build_frame(closes, atr_pct=0.003)
+    bt = Backtest(
+        strategy=_OneShotLong("BTC/USDT", stop=50.0, take=105.0),
+        commission=FlatCommission(rate=0.0),
+        slippage=FixedSlippage(bps=100.0),
+        config=BacktestConfig(initial_equity=10_000.0, warmup_bars=2),
+    )
+    result = bt.run(df)
+    take_trades = [t for t in result.trades if t.exit_reason == "take"]
+    assert take_trades, "expected at least one take exit"
+    take = take_trades[0]
+    # Long exit sells with slippage; fill is below the take trigger.
+    assert take.exit_price < 105.0
+    assert take.exit_price == pytest.approx(105.0 * (1.0 - 0.01))
+
+
+class _RecordingSlippage:
+    """Slippage spy: records every call so we can assert on the ATR arg."""
+
+    def __init__(self) -> None:
+        self.calls = []  # list of (price, side, atr)
+
+    def apply(self, price, side, atr=None):
+        self.calls.append((price, side, atr))
+        return price
+
+
+def test_atr_is_passed_to_slippage_model() -> None:
+    """AtrSlippage was always falling back to its floor because the
+    engine never passed an ATR value. Verify the engine forwards a
+    finite ATR on every fill once warm-up is past.
+    """
+    closes = [100.0 + (i % 5) for i in range(60)]
+    df = _build_frame(closes, atr_pct=0.005)
+    spy = _RecordingSlippage()
+    bt = Backtest(
+        strategy=_OneShotLong("BTC/USDT", stop=80.0, take=200.0),
+        commission=FlatCommission(rate=0.0),
+        slippage=spy,
+        config=BacktestConfig(initial_equity=10_000.0, warmup_bars=20),
+    )
+    bt.run(df)
+    # The strategy fires exactly once, so spy.calls has one entry,
+    # the entry fill. (The position is force-closed at end_of_data,
+    # which is the second call.)
+    assert spy.calls, "slippage was never invoked"
+    entry_call = spy.calls[0]
+    _, _, entry_atr = entry_call
+    # ATR must be a finite positive number, not None.
+    assert entry_atr is not None
+    assert math.isfinite(entry_atr)
+    assert entry_atr > 0.0
