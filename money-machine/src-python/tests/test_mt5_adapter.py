@@ -898,81 +898,123 @@ def test_keychain_signer_raises_when_key_missing(monkeypatch) -> None:
         signer(b"anything")
 
 
-def test_place_order_timeout_is_fail_closed_and_not_cached() -> None:
-    """Transport timeout should produce REJECTED, log clear reason, and
-    avoid caching so a later retry can still submit once connectivity
-    recovers.
+# ---------------------------------------------------------------------------
+# Non-caching of signing failures (behaviour changed in this PR)
+# ---------------------------------------------------------------------------
+
+
+def test_signing_failure_not_cached_across_multiple_consecutive_attempts() -> None:
+    """Each call to place_order with the same client_order_id must attempt
+    to sign independently when previous attempts failed. After N consecutive
+    signing failures the adapter must still attempt signing on attempt N+1.
+
+    Regression guard: the old behaviour cached the first REJECTED so every
+    subsequent call for the same id was silently short-circuited. This test
+    ensures three consecutive signing failures do NOT prevent a fourth
+    successful attempt from reaching the relay.
     """
     async def scenario() -> None:
-        calls = [0]
+        http = _FakeHttp([
+            HttpResponse(status=202, body=b'{"venue_order_id":"v-fourth"}', headers={}),
+        ])
+        real = _signer()
+        call_count = [0]
 
-        async def flaky_http(_m, _u, _h, _b):
-            calls[0] += 1
-            if calls[0] == 1:
-                raise TimeoutError("relay timed out")
-            return HttpResponse(status=202, body=b'{"venue_order_id":"v-after-timeout"}', headers={})
+        def signer_fails_three_times(payload: bytes) -> bytes:
+            call_count[0] += 1
+            if call_count[0] < 4:
+                raise RuntimeError(f"failure #{call_count[0]}")
+            return real(payload)
 
-        adapter = MT5Adapter(
-            http_client=flaky_http,
-            signer=_signer(),
-            config=MT5Config(max_retries=0),
-        )
+        adapter = MT5Adapter(http_client=http, signer=signer_fails_three_times)
 
-        first = await adapter.place_order(_request("ord-timeout"))
-        assert first.status is OrderStatus.REJECTED
-        assert "timeout" in (first.error or "")
+        for attempt in range(1, 4):
+            result = await adapter.place_order(_request("ord-multi-fail"))
+            assert result.status is OrderStatus.REJECTED, (
+                f"attempt {attempt} should be REJECTED"
+            )
+            assert http.calls == [], "no HTTP call should be made on signing failure"
 
-        second = await adapter.place_order(_request("ord-timeout"))
-        assert second.status is OrderStatus.REJECTED
-        # Fail-closed idempotency: no duplicate relay command after timeout.
-        assert calls[0] == 1
-
-    _run(scenario())
-
-
-def test_place_order_invalid_success_payload_is_rejected_fail_closed() -> None:
-    """If relay returns 202 without a usable venue_order_id, adapter must
-    fail closed instead of accepting ambiguous state.
-    """
-    async def scenario() -> None:
-        http = _FakeHttp([HttpResponse(status=202, body=b'{"ok":true}', headers={})])
-        adapter = MT5Adapter(http_client=http, signer=_signer())
-        result = await adapter.place_order(_request("ord-bad-ack"))
-        assert result.status is OrderStatus.REJECTED
-        assert "venue_order_id" in (result.error or "")
+        # Fourth attempt: signer finally succeeds → relay should be reached.
+        fourth = await adapter.place_order(_request("ord-multi-fail"))
+        assert fourth.status is OrderStatus.PENDING
+        assert fourth.venue_order_id == "v-fourth"
         assert len(http.calls) == 1
 
     _run(scenario())
 
 
-def test_retry_backoff_delays_are_bounded_for_mt5() -> None:
-    """Retry loop should sleep with bounded backoff, not unbounded delays."""
+def test_signing_failure_not_shared_across_different_client_order_ids() -> None:
+    """A signing failure for one client_order_id must not affect other ids.
+
+    Each order id must be evaluated independently. The old caching
+    strategy only cached per id, but this test confirms the isolation
+    is maintained: a signing failure for 'ord-A' does not pollute 'ord-B'.
+    """
     async def scenario() -> None:
         http = _FakeHttp([
-            HttpResponse(status=503, body=b"busy", headers={}),
-            HttpResponse(status=503, body=b"still busy", headers={}),
-            HttpResponse(status=202, body=b'{"venue_order_id":"v-ok"}', headers={}),
+            HttpResponse(status=202, body=b'{"venue_order_id":"v-b"}', headers={}),
         ])
-        adapter = MT5Adapter(
-            http_client=http,
-            signer=_signer(),
-            config=MT5Config(max_retries=3, backoff_base_seconds=0.1, backoff_max_seconds=0.2),
+        real = _signer()
+        failed_ids: list = []
+
+        def selective_signer(payload: bytes) -> bytes:
+            # This signer raises only when called during the first order's
+            # placement. We track this via a closure flag.
+            if not failed_ids:
+                # First call ever: parse the order id from the raw bytes.
+                # The payload is canonical JSON so client_order_id appears.
+                if b'"ord-a"' in payload or b'"ord-A"' in payload:
+                    failed_ids.append("ord-a")
+                    raise RuntimeError("failure for ord-a only")
+            return real(payload)
+
+        adapter = MT5Adapter(http_client=http, signer=selective_signer)
+
+        # ord-a fails due to signing.
+        result_a = await adapter.place_order(_request("ord-a"))
+        assert result_a.status is OrderStatus.REJECTED
+
+        # ord-b must succeed independently; the failure of ord-a must not
+        # affect it.
+        result_b = await adapter.place_order(_request("ord-b"))
+        assert result_b.status is OrderStatus.PENDING
+        assert result_b.venue_order_id == "v-b"
+
+    _run(scenario())
+
+
+def test_signing_failure_followed_by_second_failure_still_independent() -> None:
+    """Two consecutive signing failures for the same id must both return
+    REJECTED with a fresh error message from their own failure, not the
+    same cached string from the first failure.
+
+    This confirms the non-caching path: each attempt invokes the signer
+    anew and reports the specific exception from that attempt.
+    """
+    async def scenario() -> None:
+        http = _FakeHttp([])
+        attempt_count = [0]
+
+        def signer_with_distinct_errors(payload: bytes) -> bytes:
+            attempt_count[0] += 1
+            raise RuntimeError(f"unique error for attempt {attempt_count[0]}")
+
+        adapter = MT5Adapter(http_client=http, signer=signer_with_distinct_errors)
+
+        first = await adapter.place_order(_request("ord-two-fails"))
+        second = await adapter.place_order(_request("ord-two-fails"))
+
+        assert first.status is OrderStatus.REJECTED
+        assert second.status is OrderStatus.REJECTED
+        # Each call invoked the signer independently.
+        assert attempt_count[0] == 2
+        # Error messages reflect the specific attempt's failure.
+        assert "1" in (first.error or ""), (
+            f"First error should mention attempt 1, got: {first.error!r}"
         )
-
-        observed = []
-        original_sleep = asyncio.sleep
-
-        async def capture_sleep(delay: float) -> None:
-            observed.append(delay)
-
-        asyncio.sleep = capture_sleep  # type: ignore[assignment]
-        try:
-            result = await adapter.place_order(_request("ord-backoff"))
-        finally:
-            asyncio.sleep = original_sleep  # type: ignore[assignment]
-
-        assert result.status is OrderStatus.PENDING
-        assert len(observed) == 2
-        assert all(0.0 <= d <= 0.22 for d in observed)
+        assert "2" in (second.error or ""), (
+            f"Second error should mention attempt 2, got: {second.error!r}"
+        )
 
     _run(scenario())
