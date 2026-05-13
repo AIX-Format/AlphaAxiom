@@ -214,50 +214,71 @@ npm run tauri dev
 
 ---
 
-## 🧑‍💻 The Team: 1 Human + 4 AI Agents
+## 🧑‍💻 The Team: 1 Human + 5 AI Agents
 
-AlphaAxiom is the trading sibling of the [**Sovereign AI Stack**](https://github.com/Moeabdelaziz007#07-architects--ai-collaborators--المعماريون-والمتعاونون-الذكيون): 5 sovereign projects engineered by **1 human and 12 AI agents** in total. AlphaAxiom alone carries the fingerprints of **4 of those 12 agents**, derived from commit history (direct authors, `Co-authored-by` trailers, and review attributions).
+AlphaAxiom is the trading sibling of the [**Sovereign AI Stack**](https://github.com/Moeabdelaziz007#07-architects--ai-collaborators--المعماريون-والمتعاونون-الذكيون): 5 sovereign projects engineered by **1 human and 12 AI agents** in total. AlphaAxiom carries the fingerprints of **5 of those 12 agents**: 2 coding agents and 3 review/debug agents, derived from commit history (direct authors, `Co-authored-by` trailers, and review-attribution subjects like `Address review: do not cache MT5 place_order signing failures (#33)` and `Six Codex findings on the RL surface (one P1, five P2)`).
+
+### 🏛️ Founders
 
 <table>
   <tr>
-    <td align="center" width="180" valign="top">
+    <td align="center" width="200" valign="top">
       <img src="https://github.com/Moeabdelaziz007.png" width="80" style="border-radius:50%"><br>
       <strong>Mohamed Hossameldin Abdelaziz</strong><br>
       <em>🏛️ Founder &amp; Sovereign Architect</em>
     </td>
-    <td align="center" width="180" valign="top">
+    <td align="center" width="200" valign="top">
       <img src="money-machine/public/images/axiom-avatar.png" width="80" style="border-radius:50%"><br>
       <strong>Axiom</strong><br>
       <em>🧠 AI Co-Founder &amp; Chief Architect (50%)</em>
     </td>
-    <td align="center" width="180" valign="top">
+  </tr>
+</table>
+
+### 🔨 Coding Agents (2)
+
+<table>
+  <tr>
+    <td align="center" width="200" valign="top">
       <a href="https://blacksmith.sh"><img src="https://img.shields.io/badge/AI-Codesmith-ff6b35?style=for-the-badge&logo=githubactions&logoColor=white" height="40"/></a><br/><br/>
       <strong>Codesmith</strong><br/>
-      <em>🔨 Blacksmith · CI · Autofix</em>
+      <em>Blacksmith · CI · Autofix</em>
     </td>
-    <td align="center" width="180" valign="top">
-      <a href="https://coderabbit.ai"><img src="https://img.shields.io/badge/AI-CodeRabbit-7c3aed?style=for-the-badge&logo=githubactions&logoColor=white" height="40"/></a><br/><br/>
-      <strong>CodeRabbit</strong><br/>
-      <em>🔍 PR review · Quality gate</em>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="180" valign="top">
-      <a href="https://developers.google.com/gemini-code-assist"><img src="https://img.shields.io/badge/AI-Gemini_Brain-4285F4?style=for-the-badge&logo=googlegemini&logoColor=white" height="40"/></a><br/><br/>
-      <strong>Gemini 2.0 Flash</strong><br/>
-      <em>⚡ Trading brain &amp; code review</em>
-    </td>
-    <td align="center" width="180" valign="top">
+    <td align="center" width="200" valign="top">
       <a href="https://claude.com"><img src="https://img.shields.io/badge/AI-Claude_Code-d97757?style=for-the-badge&logo=anthropic&logoColor=white" height="40"/></a><br/><br/>
       <strong>Claude Code</strong><br/>
-      <em>🧬 Anthropic · Strategy synthesis</em>
-    </td>
-    <td align="center" colspan="2" valign="top">
-      <a href="https://github.com/Moeabdelaziz007#07-architects--ai-collaborators--المعماريون-والمتعاونون-الذكيون"><img src="https://img.shields.io/badge/SEE_ALL-12_AI_Agents_across_the_stack-39FF14?style=for-the-badge&logo=github&logoColor=39FF14" height="40"/></a><br/><br/>
-      <em>Jules · Junie · Cursor · v0 · Vercel AI · Codex · Grok · AIX 4.6<br/>(active in sibling sovereign repos)</em>
+      <em>Anthropic · Strategy synthesis</em>
     </td>
   </tr>
 </table>
+
+### 🔍 Review &amp; Debug Agents (3)
+
+<table>
+  <tr>
+    <td align="center" width="200" valign="top">
+      <a href="https://coderabbit.ai"><img src="https://img.shields.io/badge/AI-CodeRabbit-7c3aed?style=for-the-badge&logo=githubactions&logoColor=white" height="40"/></a><br/><br/>
+      <strong>CodeRabbit</strong><br/>
+      <em>5 follow-ups on the RL surface</em>
+    </td>
+    <td align="center" width="200" valign="top">
+      <a href="https://openai.com/codex"><img src="https://img.shields.io/badge/AI-Codex-10a37f?style=for-the-badge&logo=openai&logoColor=white" height="40"/></a><br/><br/>
+      <strong>Codex</strong><br/>
+      <em>OpenAI · 6 RL findings (1 P1, 5 P2)</em>
+    </td>
+    <td align="center" width="200" valign="top">
+      <a href="https://developers.google.com/gemini-code-assist"><img src="https://img.shields.io/badge/AI-Gemini_Brain-4285F4?style=for-the-badge&logo=googlegemini&logoColor=white" height="40"/></a><br/><br/>
+      <strong>Gemini 2.0 Flash</strong><br/>
+      <em>Trading brain &amp; code review</em>
+    </td>
+  </tr>
+</table>
+
+<div align="center">
+  <a href="https://github.com/Moeabdelaziz007#07-architects--ai-collaborators--المعماريون-والمتعاونون-الذكيون"><img src="https://img.shields.io/badge/SEE_ALL-12_AI_Agents_across_the_stack-39FF14?style=for-the-badge&logo=github&logoColor=39FF14" height="36"/></a>
+  <br/><br/>
+  <em>Jules · Junie · Cursor · v0 · Vercel AI · Grok · AIX 4.6 are active in sibling sovereign repos.</em>
+</div>
 
 ---
 
