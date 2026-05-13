@@ -188,6 +188,15 @@ def test_true_range_non_negative(fixture_df: pd.DataFrame) -> None:
     assert (tr >= 0.0).all()
 
 
+def test_true_range_handles_empty_input() -> None:
+    empty = pd.Series([], dtype=float)
+    tr = true_range(empty, empty, empty)
+    assert tr.empty
+    # ATR built on top of TR must also tolerate empty input gracefully.
+    out = atr(empty, empty, empty, period=14)
+    assert out.empty
+
+
 def test_atr_non_negative_and_warmup(fixture_df: pd.DataFrame) -> None:
     out = atr(fixture_df["high"], fixture_df["low"], fixture_df["close"], period=14)
     # SMA-seeded warm-up: first period-1 rows are NaN, the seed lands at
@@ -317,7 +326,7 @@ def test_atr_reference_values_period_three() -> None:
 
 
 def test_macd_returns_three_aligned_series(fixture_df: pd.DataFrame) -> None:
-    macd_line, signal_line, hist = macd(
+    macd_line, signal_line, _hist = macd(
         fixture_df["close"], fast_period=12, slow_period=26, signal_period=9
     )
     # MACD line is defined once the slow EMA warms up: from index 25.

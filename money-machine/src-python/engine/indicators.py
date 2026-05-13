@@ -192,13 +192,16 @@ def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
 
     `TR = max(high - low, |high - prev_close|, |low - prev_close|)`.
     The first row falls back to `high - low` because there is no
-    previous close.
+    previous close. Empty inputs return an empty Series so the
+    documented short-input behaviour holds.
     """
     prev_close = close.shift(1)
     hl = high - low
     hc = (high - prev_close).abs()
     lc = (low - prev_close).abs()
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    if tr.empty:
+        return tr
     tr.iloc[0] = hl.iloc[0]
     return tr
 
