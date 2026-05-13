@@ -392,6 +392,132 @@ def test_cancel_unknown_order_returns_rejection() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_cancel_signing_failure_returns_rejected_not_stale() -> None:
+    """A signing failure during cancel must NOT silently return the
+    stale PENDING order. Surface it as REJECTED with the error
+    text so callers can distinguish 'cancel failed' from 'cancel
+    succeeded'.
+    """
+    async def scenario() -> None:
+        http = _FakeHttp([HttpResponse(status=202, body=b'{"venue_order_id":"v"}', headers={})])
+
+        # A signer that succeeds first (for place_order), then fails
+        # on the second call (cancel).
+        call_count = [0]
+        real_signer = _signer()
+
+        def flaky_signer(payload: bytes) -> bytes:
+            call_count[0] += 1
+            if call_count[0] >= 2:
+                raise RuntimeError("hsm offline")
+            return real_signer(payload)
+
+        adapter = MT5Adapter(http_client=http, signer=flaky_signer)
+        await adapter.place_order(_request("ord-cs"))
+        result = await adapter.cancel_order("ord-cs")
+        assert result.status is OrderStatus.REJECTED
+        assert "signing failed" in (result.error or "")
+
+    _run(scenario())
+
+
+def test_cancel_relay_failure_returns_rejected_not_stale() -> None:
+    """Non-2xx response on the cancel call must NOT return the
+    stale order; return a REJECTED with the HTTP error text.
+    """
+    async def scenario() -> None:
+        http = _FakeHttp([
+            HttpResponse(status=202, body=b'{"venue_order_id":"v"}', headers={}),
+            HttpResponse(status=400, body=b"cancel rejected by relay", headers={}),
+        ])
+        adapter = MT5Adapter(http_client=http, signer=_signer())
+        await adapter.place_order(_request("ord-cr"))
+        result = await adapter.cancel_order("ord-cr")
+        assert result.status is OrderStatus.REJECTED
+        assert "cancel relay HTTP 400" in (result.error or "")
+        assert "cancel rejected by relay" in (result.error or "")
+
+    _run(scenario())
+
+
+def test_cancel_respects_relay_filled_response() -> None:
+    """If the relay reports the order already filled during a cancel
+    race, the cache must reflect FILLED, not CANCELLED.
+    """
+    async def scenario() -> None:
+        http = _FakeHttp([
+            HttpResponse(status=202, body=b'{"venue_order_id":"v"}', headers={}),
+            HttpResponse(
+                status=200,
+                body=b'{"status":"FILLED","filled_quantity":0.1,"average_fill_price":50000.0}',
+                headers={},
+            ),
+        ])
+        adapter = MT5Adapter(http_client=http, signer=_signer())
+        await adapter.place_order(_request("ord-race"))
+        result = await adapter.cancel_order("ord-race")
+        assert result.status is OrderStatus.FILLED
+        assert result.filled_quantity == pytest.approx(0.1)
+        assert result.metadata.get("cancel_race") == "filled_first"
+
+    _run(scenario())
+
+
+def test_cancel_request_includes_public_key_header() -> None:
+    """The relay routes/authenticates on X-Public-Key-Id; the cancel
+    endpoint must include the same header place_order uses.
+    """
+    async def scenario() -> None:
+        http = _FakeHttp([
+            HttpResponse(status=202, body=b'{"venue_order_id":"v"}', headers={}),
+            HttpResponse(status=200, body=b'{"cancelled":true}', headers={}),
+        ])
+        adapter = MT5Adapter(
+            http_client=http,
+            signer=_signer(),
+            public_key_id="prod-key-1",
+        )
+        await adapter.place_order(_request("ord-h"))
+        await adapter.cancel_order("ord-h")
+        # Second call is the cancel.
+        _, _, headers, _ = http.calls[1]
+        assert headers.get("X-Public-Key-Id") == "prod-key-1"
+
+    _run(scenario())
+
+
+def test_response_non_dict_body_does_not_crash() -> None:
+    """A relay that returns a JSON list or a bare string on success
+    must not crash the adapter when we look up `venue_order_id`.
+    """
+    async def scenario() -> None:
+        http = _FakeHttp([HttpResponse(status=202, body=b'["unexpected"]', headers={})])
+        adapter = MT5Adapter(http_client=http, signer=_signer())
+        result = await adapter.place_order(_request("ord-list"))
+        assert result.status is OrderStatus.PENDING
+        assert result.venue_order_id is None
+
+    _run(scenario())
+
+
+def test_get_open_orders_uses_lock_for_consistent_snapshot() -> None:
+    """Sanity: even under no contention, get_open_orders returns a
+    coherent snapshot list rather than iterating the live dict.
+    """
+    async def scenario() -> None:
+        http = _FakeHttp([
+            HttpResponse(status=202, body=b'{"venue_order_id":"v1"}', headers={}),
+            HttpResponse(status=202, body=b'{"venue_order_id":"v2"}', headers={}),
+        ])
+        adapter = MT5Adapter(http_client=http, signer=_signer())
+        await adapter.place_order(_request("o1"))
+        await adapter.place_order(_request("o2"))
+        opens = await adapter.get_open_orders()
+        assert len(opens) == 2
+
+    _run(scenario())
+
+
 def test_keychain_signer_raises_when_key_missing(monkeypatch) -> None:
     from engine.adapters import mt5 as mt5_module
 

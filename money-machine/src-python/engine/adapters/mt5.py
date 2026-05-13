@@ -215,6 +215,11 @@ class MT5Adapter(ExecutionAdapter):
     # ------------------------------------------------------------------
 
     async def place_order(self, request: OrderRequest) -> OrderResult:
+        # Build the signed envelope under the lock (short, in-memory
+        # only), then release the lock before the HTTP call so a
+        # slow/timing-out relay request does NOT serialise every
+        # other order on this adapter instance. We re-acquire only
+        # to persist the final result in the idempotency cache.
         async with self._lock:
             cached = self._order_cache.get(request.client_order_id)
             if cached is not None:
@@ -234,9 +239,11 @@ class MT5Adapter(ExecutionAdapter):
             canonical = canonical_payload(payload)
             try:
                 signature_hex = self.signer(canonical).hex()
-            except AdapterError:
-                raise
             except Exception as exc:
+                # AdapterError is included here; the adapter contract
+                # is "no exceptions, return REJECTED" and signing is
+                # a routine failure path (missing keychain entry,
+                # libsodium quirk, etc.).
                 result = self._rejected(request, f"signing failed: {exc}")
                 self._order_cache[request.client_order_id] = result
                 return result
@@ -254,18 +261,35 @@ class MT5Adapter(ExecutionAdapter):
             }
             url = self.config.oracle_url.rstrip("/") + "/signals"
 
-            response = await self._post_with_retries(url, headers, body)
-            result = self._result_from_response(request, response)
+        # Lock released; the retry loop runs without head-of-line
+        # blocking other client_order_ids.
+        response = await self._post_with_retries(url, headers, body)
+        result = self._result_from_response(request, response)
+        async with self._lock:
+            # Last-writer wins, but the idempotency cache check at
+            # the top means a competing retry of the SAME id would
+            # have returned the prior cached result instead of
+            # getting here.
             self._order_cache[request.client_order_id] = result
-            return result
+        return result
 
     async def cancel_order(self, client_order_id: str) -> OrderResult:
         """Cancel a previously sent signal.
 
         Sends a signed cancel envelope to the Worker. The semantics
-        match the venue: a PENDING order becomes CANCELLED, a FILLED
-        order returns its current state, and an unknown id is
-        REJECTED.
+        match the venue:
+
+          - unknown id: REJECTED, never reaches the relay.
+          - already FILLED / CANCELLED / REJECTED: return the
+            existing cached state, no relay call.
+          - signing failure: return a fresh REJECTED with the
+            error text, leave the cache untouched so the caller
+            can retry.
+          - relay non-2xx: return a fresh REJECTED with the HTTP
+            error text, leave the cache untouched.
+          - relay 2xx that reports a non-cancel terminal state
+            (already filled, etc.): respect the relay payload and
+            apply that state instead of forcing CANCELLED.
         """
         async with self._lock:
             existing = self._order_cache.get(client_order_id)
@@ -292,7 +316,15 @@ class MT5Adapter(ExecutionAdapter):
                 signature_hex = self.signer(canonical).hex()
             except Exception as exc:
                 logger.warning("MT5 cancel signing failed: %s", exc)
-                return existing
+                return OrderResult(
+                    client_order_id=existing.client_order_id,
+                    venue_order_id=existing.venue_order_id,
+                    symbol=existing.symbol,
+                    side=existing.side,
+                    order_type=existing.order_type,
+                    status=OrderStatus.REJECTED,
+                    error=f"cancel signing failed: {exc}",
+                )
             envelope = {
                 "payload": payload,
                 "signature": signature_hex,
@@ -302,12 +334,46 @@ class MT5Adapter(ExecutionAdapter):
             headers = {
                 "Content-Type": "application/json",
                 "X-Client-Order-Id": client_order_id,
+                "X-Public-Key-Id": self.public_key_id,
             }
             url = self.config.oracle_url.rstrip("/") + "/signals/cancel"
-            response = await self._post_with_retries(url, headers, body)
 
-            if 200 <= response.status < 300:
-                cancelled = OrderResult(
+        # Release the lock for the network call so other orders are
+        # not blocked while a cancel retries through the relay.
+        response = await self._post_with_retries(url, headers, body)
+
+        if 200 <= response.status < 300:
+            parsed = _safe_parse_json_dict(response.body)
+            reported_status = str(parsed.get("status", "")).upper()
+            # Race window: the relay might tell us the order already
+            # filled or was rejected. Respect that instead of
+            # forcing CANCELLED.
+            if reported_status == "FILLED":
+                final = OrderResult(
+                    client_order_id=existing.client_order_id,
+                    venue_order_id=existing.venue_order_id,
+                    symbol=existing.symbol,
+                    side=existing.side,
+                    order_type=existing.order_type,
+                    status=OrderStatus.FILLED,
+                    requested_quantity=existing.requested_quantity,
+                    filled_quantity=float(parsed.get("filled_quantity", existing.filled_quantity or 0.0)),
+                    average_fill_price=parsed.get("average_fill_price", existing.average_fill_price),
+                    fills=list(existing.fills),
+                    metadata={**(existing.metadata or {}), "cancel_race": "filled_first"},
+                )
+            elif reported_status == "REJECTED":
+                final = OrderResult(
+                    client_order_id=existing.client_order_id,
+                    venue_order_id=existing.venue_order_id,
+                    symbol=existing.symbol,
+                    side=existing.side,
+                    order_type=existing.order_type,
+                    status=OrderStatus.REJECTED,
+                    error=str(parsed.get("error", "rejected before cancel")),
+                )
+            else:
+                final = OrderResult(
                     client_order_id=existing.client_order_id,
                     venue_order_id=existing.venue_order_id,
                     symbol=existing.symbol,
@@ -319,20 +385,34 @@ class MT5Adapter(ExecutionAdapter):
                     average_fill_price=existing.average_fill_price,
                     fills=list(existing.fills),
                 )
-                self._order_cache[client_order_id] = cancelled
-                return cancelled
-            # Cancel failed at the relay: surface but keep cached state.
-            logger.warning(
-                "MT5 cancel rejected by relay (status=%s): %s",
-                response.status,
-                response.body[:200],
-            )
-            return existing
+            async with self._lock:
+                self._order_cache[client_order_id] = final
+            return final
+
+        # Non-2xx: surface the failure explicitly. Cache untouched so
+        # the caller can retry cancellation.
+        error_text = response.body[:256].decode("utf-8", errors="replace")
+        logger.warning(
+            "MT5 cancel rejected by relay (status=%s): %s",
+            response.status,
+            error_text,
+        )
+        return OrderResult(
+            client_order_id=existing.client_order_id,
+            venue_order_id=existing.venue_order_id,
+            symbol=existing.symbol,
+            side=existing.side,
+            order_type=existing.order_type,
+            status=OrderStatus.REJECTED,
+            error=f"cancel relay HTTP {response.status}: {error_text}",
+        )
 
     async def get_open_orders(self) -> List[OrderResult]:
-        return [
-            r for r in self._order_cache.values() if r.is_open
-        ]
+        # Acquire the lock + snapshot to a list so concurrent
+        # place_order / cancel_order calls cannot mutate the dict
+        # during iteration (would raise RuntimeError without this).
+        async with self._lock:
+            return [r for r in self._order_cache.values() if r.is_open]
 
     async def get_positions(self) -> Dict[str, float]:
         # The Worker holds the source of truth for MT5 positions and
@@ -422,12 +502,8 @@ class MT5Adapter(ExecutionAdapter):
     ) -> OrderResult:
         """Turn an HTTP response from the Worker into an OrderResult."""
         if 200 <= response.status < 300:
-            venue_id: Optional[str] = None
-            try:
-                parsed = json.loads(response.body.decode("utf-8"))
-                venue_id = parsed.get("venue_order_id")
-            except (ValueError, UnicodeDecodeError):
-                parsed = {}
+            parsed = _safe_parse_json_dict(response.body)
+            venue_id = parsed.get("venue_order_id")
             return OrderResult(
                 client_order_id=request.client_order_id,
                 venue_order_id=venue_id,
@@ -460,3 +536,20 @@ class MT5Adapter(ExecutionAdapter):
             status=OrderStatus.REJECTED,
             error=error,
         )
+
+
+def _safe_parse_json_dict(body: bytes) -> Dict[str, Any]:
+    """Defensive JSON decoder.
+
+    Returns the parsed dict on success, an empty dict on any failure
+    or non-dict result. Used for relay responses where a list, a
+    string, or a malformed payload would otherwise crash a `.get()`
+    call on `None`.
+    """
+    try:
+        parsed = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return parsed
