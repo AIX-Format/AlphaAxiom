@@ -10,4 +10,7 @@ python-dotenv>=1.0.0
 # IPC auth token storage (optional; falls back to env var when missing).
 keyring>=24.0.0
 # Ed25519 signing for the MT5 adapter (signed signals to the Worker relay).
-cryptography>=42.0.0
+# Pinned >=44.0.0 to clear the NULL pointer dereference, OpenSSL
+# subgroup attack, and buffer overflow CVEs that affect the 42.x
+# and 45.x series. Bump again if a new advisory lands.
+cryptography>=44.0.0
