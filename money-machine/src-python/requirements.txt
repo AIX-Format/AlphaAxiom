@@ -9,3 +9,5 @@ pyyaml>=6.0
 python-dotenv>=1.0.0
 # IPC auth token storage (optional; falls back to env var when missing).
 keyring>=24.0.0
+# Ed25519 signing for the MT5 adapter (signed signals to the Worker relay).
+cryptography>=42.0.0
