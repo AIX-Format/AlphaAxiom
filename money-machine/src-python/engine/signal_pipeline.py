@@ -150,10 +150,17 @@ class SignalPipeline:
                     signal.action,
                     decision.reason.value if decision.reason else "unknown",
                 )
+            # Preserve the proposed size on the result even when the
+            # shield rejects the trade. Audit/telemetry consumers need
+            # to be able to distinguish "no size was computed" (e.g.
+            # equity <= 0) from "a sized order was explicitly blocked
+            # by the risk shield" (e.g. POSITION_SIZE_EXCEEDED). Both
+            # cases reach this branch; only the latter carries useful
+            # sizing context.
             return PipelineResult(
                 signal=signal,
                 risk_decision=decision,
-                position_size=proposed_size if decision.approved else 0.0,
+                position_size=proposed_size,
             )
 
         execution = await self._execute(signal, proposed_size)
@@ -197,27 +204,50 @@ class SignalPipeline:
         )
 
     def _snapshot_portfolio(self, proposed_notional: float) -> PortfolioState:
-        """Capture the state the risk shield needs for one decision."""
+        """Capture the state the risk shield needs for one decision.
+
+        Daily PnL fed into the shield combines realised PnL since
+        UTC midnight with the current unrealised mark on open
+        positions. Without the unrealised piece a strategy could
+        sit on a 10% open drawdown all day and only trip the
+        emergency stop after the position was closed, which defeats
+        the point of `daily_loss_limit`.
+        """
         portfolio = self.engine.portfolio
         equity = self._equity()
         open_positions = self._open_position_count()
-        daily_pnl = (
-            portfolio.daily_pnl()
-            if hasattr(portfolio, "daily_pnl")
-            else 0.0
-        )
-        hwm = (
-            portfolio.high_water_mark()
-            if hasattr(portfolio, "high_water_mark")
-            else equity
-        )
+        daily_pnl = self._read_metric(portfolio, "daily_pnl", default=0.0)
+        unrealised = self._read_metric(portfolio, "calculate_pnl", default=0.0)
+        daily_pnl_total = float(daily_pnl) + float(unrealised)
+        hwm = self._read_metric(portfolio, "high_water_mark", default=equity)
         return PortfolioState(
             equity=equity,
             open_positions=open_positions,
             proposed_notional=proposed_notional,
-            daily_pnl=daily_pnl,
-            high_water_mark=hwm,
+            daily_pnl=daily_pnl_total,
+            high_water_mark=float(hwm),
         )
+
+    @staticmethod
+    def _read_metric(portfolio: Any, name: str, *, default: float) -> float:
+        """Read a portfolio metric exposed either as a method or attribute.
+
+        Some adapters expose `high_water_mark` as a numeric field or
+        a `@property`; others as a method. We accept both shapes so
+        the pipeline does not raise `TypeError` on a bare attribute.
+        """
+        attr = getattr(portfolio, name, None)
+        if attr is None:
+            return float(default)
+        if callable(attr):
+            try:
+                return float(attr())
+            except Exception:
+                return float(default)
+        try:
+            return float(attr)
+        except (TypeError, ValueError):
+            return float(default)
 
     def _equity(self) -> float:
         portfolio = self.engine.portfolio

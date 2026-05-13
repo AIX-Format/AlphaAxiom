@@ -243,6 +243,10 @@ def test_oversized_proposal_is_rejected_and_logged() -> None:
     assert (
         result.risk_decision.reason == RejectionReason.POSITION_SIZE_EXCEEDED
     )
+    # The proposed size is preserved on the result even though the
+    # trade was blocked: audit/telemetry consumers need to see what
+    # was attempted, not a flat 0.0.
+    assert result.position_size > 0.0
     # Audit log records the rejection with the right fields.
     log = shield.audit_log()
     assert len(log) == 1
@@ -333,6 +337,70 @@ def test_high_water_mark_tracks_balance_peak() -> None:
     # New peak raises the HWM.
     portfolio.add_trade({"pnl": 2_000.0})
     assert portfolio.high_water_mark() == pytest.approx(11_700.0)
+
+
+def test_unrealised_pnl_feeds_daily_loss_limit() -> None:
+    """An open-position drawdown should trip daily_loss_limit even
+    before the trade is closed. Without this the shield would only
+    see realised PnL and a strategy could sit on a 10% open loss
+    all day.
+    """
+    portfolio = Portfolio(initial_balance=10_000.0)
+    # Inject an open position carrying unrealised PnL of -300 (3%).
+    portfolio.positions["BTC/USDT"] = {"pnl": -300.0}
+    engine = StubEngine(portfolio=portfolio)
+    shield = RiskShield(
+        config=RiskConfig(daily_loss_limit_pct=0.02),
+        clock=_frozen_clock(T0),
+    )
+    pipeline = SignalPipeline(
+        FixedSignalStrategy(_buy_signal()),
+        shield,
+        engine,
+        config=PipelineConfig(risk_per_trade_pct=0.0005, fallback_stop_pct=0.02),
+    )
+
+    result = _run(pipeline.run_once(pd.DataFrame()))
+    assert result.executed is False
+    assert result.risk_decision.reason == RejectionReason.DAILY_LOSS_LIMIT
+    assert shield.is_emergency_stop_active() is True
+
+
+def test_portfolio_metrics_accept_attribute_form() -> None:
+    """If an adapter exposes high_water_mark as a plain attribute or
+    property instead of a method, the pipeline should still read it
+    without raising TypeError.
+    """
+
+    class _AttrPortfolio:
+        balance = 10_000.0
+        positions: dict = {}
+        # High-water mark as a plain attribute, not a method.
+        high_water_mark = 12_000.0
+
+        def get_balance(self) -> float:
+            return self.balance
+
+        def get_positions(self) -> dict:
+            return self.positions
+
+        # No daily_pnl/calculate_pnl on purpose: the pipeline should
+        # default them to 0 rather than crash.
+
+    engine = StubEngine(portfolio=_AttrPortfolio())  # type: ignore[arg-type]
+    shield = RiskShield(clock=_frozen_clock(T0))
+    pipeline = SignalPipeline(
+        FixedSignalStrategy(_buy_signal()),
+        shield,
+        engine,
+    )
+
+    result = _run(pipeline.run_once(pd.DataFrame()))
+    # Did not raise; got a sensible decision back.
+    assert isinstance(result, PipelineResult)
+    # And the HWM read should have made it into the rejection context
+    # if rejected, or stayed coherent if approved.
+    assert result.risk_decision.approved or result.position_size > 0.0
 
 
 def test_drawdown_trip_via_pipeline_flow() -> None:
