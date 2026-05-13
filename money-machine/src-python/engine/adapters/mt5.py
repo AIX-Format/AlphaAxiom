@@ -208,12 +208,14 @@ class MT5Adapter(ExecutionAdapter):
         # Anything PENDING is also cached so a retry sees the same
         # response without re-signing.
         self._order_cache: Dict[str, OrderResult] = {}
-        # In-flight placeholder map: when a place_order call is mid
-        # HTTP retry, its client_order_id maps to a Future here so a
-        # concurrent caller for the same id awaits the original
-        # result instead of submitting a duplicate signed signal.
-        # Cleared once the result lands in `_order_cache`.
+        # In-flight placeholder maps: when a place_order or
+        # cancel_order call is mid HTTP retry, its client_order_id
+        # maps to a Future so a concurrent caller for the same id
+        # awaits the original result instead of submitting a
+        # duplicate signed envelope. Cleared once the result lands
+        # in `_order_cache`.
         self._in_flight: Dict[str, "asyncio.Future[OrderResult]"] = {}
+        self._in_flight_cancels: Dict[str, "asyncio.Future[OrderResult]"] = {}
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
@@ -292,8 +294,22 @@ class MT5Adapter(ExecutionAdapter):
         try:
             response = await self._post_with_retries(url, headers, body)
             result = self._result_from_response(request, response)
-        except Exception as exc:  # defensive; _post_with_retries should not raise
-            result = self._rejected(request, f"unexpected transport failure: {exc}")
+        except BaseException as exc:
+            # Catch BaseException so asyncio.CancelledError (which
+            # inherits from BaseException, not Exception) cannot
+            # leak past the in-flight cleanup. Otherwise a cancel
+            # mid-retry would leave the client_order_id parked
+            # forever and concurrent callers would await an
+            # unresolved Future indefinitely.
+            result = self._rejected(
+                request, f"place_order aborted: {type(exc).__name__}: {exc}"
+            )
+            async with self._lock:
+                self._order_cache[request.client_order_id] = result
+                self._in_flight.pop(request.client_order_id, None)
+            if not future.done():
+                future.set_result(result)
+            raise
 
         async with self._lock:
             self._order_cache[request.client_order_id] = result
@@ -319,6 +335,13 @@ class MT5Adapter(ExecutionAdapter):
           - relay 2xx that reports a non-cancel terminal state
             (already filled, etc.): respect the relay payload and
             apply that state instead of forcing CANCELLED.
+
+        Concurrent cancels for the same client_order_id are
+        serialised through an in-flight Future map, mirroring
+        place_order's idempotency pattern. Without it, two parallel
+        cancellations would both POST `/signals/cancel` and one
+        would see "already cancelled" / REJECTED from the relay,
+        violating idempotent cancel semantics.
         """
         async with self._lock:
             existing = self._order_cache.get(client_order_id)
@@ -335,50 +358,131 @@ class MT5Adapter(ExecutionAdapter):
             if existing.status in (OrderStatus.CANCELLED, OrderStatus.FILLED, OrderStatus.REJECTED):
                 return existing
 
-            payload = {
-                "client_order_id": client_order_id,
-                "action": "CANCEL",
-                "timestamp": self.clock().isoformat(),
-            }
-            canonical = canonical_payload(payload)
-            try:
-                signature_hex = self.signer(canonical).hex()
-            except Exception as exc:
-                logger.warning("MT5 cancel signing failed: %s", exc)
-                return OrderResult(
-                    client_order_id=existing.client_order_id,
-                    venue_order_id=existing.venue_order_id,
-                    symbol=existing.symbol,
-                    side=existing.side,
-                    order_type=existing.order_type,
-                    status=OrderStatus.REJECTED,
-                    error=f"cancel signing failed: {exc}",
-                )
-            envelope = {
-                "payload": payload,
-                "signature": signature_hex,
-                "public_key_id": self.public_key_id,
-            }
-            body = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
-            headers = {
-                "Content-Type": "application/json",
-                "X-Client-Order-Id": client_order_id,
-                "X-Public-Key-Id": self.public_key_id,
-            }
-            url = self.config.oracle_url.rstrip("/") + "/signals/cancel"
+            inflight_cancel = self._in_flight_cancels.get(client_order_id)
+            if inflight_cancel is not None:
+                # Another coroutine is already cancelling this id;
+                # await its result outside the lock instead of
+                # signing and POSTing a duplicate.
+                cancel_future = inflight_cancel
+            else:
+                payload = {
+                    "client_order_id": client_order_id,
+                    "action": "CANCEL",
+                    "timestamp": self.clock().isoformat(),
+                }
+                canonical = canonical_payload(payload)
+                try:
+                    signature_hex = self.signer(canonical).hex()
+                except Exception as exc:
+                    logger.warning("MT5 cancel signing failed: %s", exc)
+                    return OrderResult(
+                        client_order_id=existing.client_order_id,
+                        venue_order_id=existing.venue_order_id,
+                        symbol=existing.symbol,
+                        side=existing.side,
+                        order_type=existing.order_type,
+                        status=OrderStatus.REJECTED,
+                        error=f"cancel signing failed: {exc}",
+                    )
+                envelope = {
+                    "payload": payload,
+                    "signature": signature_hex,
+                    "public_key_id": self.public_key_id,
+                }
+                body = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
+                headers = {
+                    "Content-Type": "application/json",
+                    "X-Client-Order-Id": client_order_id,
+                    "X-Public-Key-Id": self.public_key_id,
+                }
+                url = self.config.oracle_url.rstrip("/") + "/signals/cancel"
+
+                cancel_future = asyncio.get_event_loop().create_future()
+                self._in_flight_cancels[client_order_id] = cancel_future
+
+        if inflight_cancel is not None:
+            # Wait for the original cancel to complete and return
+            # the same OrderResult so the second caller observes
+            # the same outcome as the first.
+            return await cancel_future
 
         # Release the lock for the network call so other orders are
-        # not blocked while a cancel retries through the relay.
-        response = await self._post_with_retries(url, headers, body)
+        # not blocked while a cancel retries through the relay. Any
+        # exception from the retry loop must still resolve the
+        # in-flight Future so concurrent callers do not wait forever.
+        try:
+            response = await self._post_with_retries(url, headers, body)
+            final = self._build_cancel_result(existing, response)
+        except BaseException as exc:
+            # Includes asyncio.CancelledError (which is a
+            # BaseException, not Exception). Resolve the future so
+            # any waiting callers see a deterministic result and
+            # clear the in-flight slot before re-raising.
+            failed = OrderResult(
+                client_order_id=existing.client_order_id,
+                venue_order_id=existing.venue_order_id,
+                symbol=existing.symbol,
+                side=existing.side,
+                order_type=existing.order_type,
+                status=OrderStatus.REJECTED,
+                error=f"cancel aborted: {type(exc).__name__}",
+            )
+            async with self._lock:
+                self._in_flight_cancels.pop(client_order_id, None)
+            if not cancel_future.done():
+                cancel_future.set_result(failed)
+            raise
 
+        async with self._lock:
+            # Only persist to the cache when the cancel reached a
+            # terminal state on the venue side (2xx CANCELLED /
+            # FILLED / REJECTED). Pure transport failures leave the
+            # cache untouched so the caller can retry.
+            if final.status in (OrderStatus.CANCELLED, OrderStatus.FILLED, OrderStatus.REJECTED):
+                # Only overwrite the cached order on actual venue
+                # responses (2xx), not on transport-layer rejections
+                # surfaced as "cancel relay HTTP ...".
+                if 200 <= response.status < 300:
+                    self._order_cache[client_order_id] = final
+            self._in_flight_cancels.pop(client_order_id, None)
+        if not cancel_future.done():
+            cancel_future.set_result(final)
+        return final
+
+    def _build_cancel_result(
+        self,
+        existing: OrderResult,
+        response: HttpResponse,
+    ) -> OrderResult:
+        """Translate a cancel HTTP response into an OrderResult.
+
+        2xx with `status=FILLED` in the body returns the FILLED
+        race state; 2xx with `status=REJECTED` returns REJECTED;
+        any other 2xx body becomes CANCELLED. Non-2xx returns a
+        REJECTED result that includes the HTTP status and body
+        text so the caller can decide whether to retry.
+        """
         if 200 <= response.status < 300:
             parsed = _safe_parse_json_dict(response.body)
             reported_status = str(parsed.get("status", "")).upper()
-            # Race window: the relay might tell us the order already
-            # filled or was rejected. Respect that instead of
-            # forcing CANCELLED.
             if reported_status == "FILLED":
-                final = OrderResult(
+                # Guard against a relay that sends `null` or a
+                # non-numeric `filled_quantity`; falling back to
+                # `existing.filled_quantity` keeps the result
+                # well-typed.
+                fq_raw = parsed.get("filled_quantity")
+                try:
+                    fq = float(fq_raw) if fq_raw is not None else float(
+                        existing.filled_quantity or 0.0
+                    )
+                except (TypeError, ValueError):
+                    fq = float(existing.filled_quantity or 0.0)
+                fp_raw = parsed.get("average_fill_price", existing.average_fill_price)
+                try:
+                    fp = float(fp_raw) if fp_raw is not None else existing.average_fill_price
+                except (TypeError, ValueError):
+                    fp = existing.average_fill_price
+                return OrderResult(
                     client_order_id=existing.client_order_id,
                     venue_order_id=existing.venue_order_id,
                     symbol=existing.symbol,
@@ -386,13 +490,13 @@ class MT5Adapter(ExecutionAdapter):
                     order_type=existing.order_type,
                     status=OrderStatus.FILLED,
                     requested_quantity=existing.requested_quantity,
-                    filled_quantity=float(parsed.get("filled_quantity", existing.filled_quantity or 0.0)),
-                    average_fill_price=parsed.get("average_fill_price", existing.average_fill_price),
+                    filled_quantity=fq,
+                    average_fill_price=fp,
                     fills=list(existing.fills),
                     metadata={**(existing.metadata or {}), "cancel_race": "filled_first"},
                 )
-            elif reported_status == "REJECTED":
-                final = OrderResult(
+            if reported_status == "REJECTED":
+                return OrderResult(
                     client_order_id=existing.client_order_id,
                     venue_order_id=existing.venue_order_id,
                     symbol=existing.symbol,
@@ -401,25 +505,21 @@ class MT5Adapter(ExecutionAdapter):
                     status=OrderStatus.REJECTED,
                     error=str(parsed.get("error", "rejected before cancel")),
                 )
-            else:
-                final = OrderResult(
-                    client_order_id=existing.client_order_id,
-                    venue_order_id=existing.venue_order_id,
-                    symbol=existing.symbol,
-                    side=existing.side,
-                    order_type=existing.order_type,
-                    status=OrderStatus.CANCELLED,
-                    requested_quantity=existing.requested_quantity,
-                    filled_quantity=existing.filled_quantity,
-                    average_fill_price=existing.average_fill_price,
-                    fills=list(existing.fills),
-                )
-            async with self._lock:
-                self._order_cache[client_order_id] = final
-            return final
+            return OrderResult(
+                client_order_id=existing.client_order_id,
+                venue_order_id=existing.venue_order_id,
+                symbol=existing.symbol,
+                side=existing.side,
+                order_type=existing.order_type,
+                status=OrderStatus.CANCELLED,
+                requested_quantity=existing.requested_quantity,
+                filled_quantity=existing.filled_quantity,
+                average_fill_price=existing.average_fill_price,
+                fills=list(existing.fills),
+            )
 
-        # Non-2xx: surface the failure explicitly. Cache untouched so
-        # the caller can retry cancellation.
+        # Non-2xx: surface the failure explicitly. Cache untouched
+        # so the caller can retry cancellation.
         error_text = response.body[:256].decode("utf-8", errors="replace")
         logger.warning(
             "MT5 cancel rejected by relay (status=%s): %s",

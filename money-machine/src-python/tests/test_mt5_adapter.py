@@ -545,6 +545,107 @@ def test_concurrent_place_order_same_id_submits_once() -> None:
     _run(scenario())
 
 
+def test_concurrent_cancel_order_same_id_hits_relay_once() -> None:
+    """Two coroutines calling cancel_order with the same
+    client_order_id concurrently must only POST /signals/cancel
+    once. The second caller awaits the in-flight Future and
+    observes the same result as the first.
+    """
+    async def scenario() -> None:
+        place_event = asyncio.Event()
+        cancel_event = asyncio.Event()
+        cancel_calls = [0]
+
+        async def http(method, url, headers, body):
+            if url.endswith("/signals"):
+                return HttpResponse(
+                    status=202, body=b'{"venue_order_id":"v"}', headers={}
+                )
+            # /signals/cancel: count and gate.
+            cancel_calls[0] += 1
+            await cancel_event.wait()
+            return HttpResponse(status=200, body=b'{"cancelled":true}', headers={})
+
+        adapter = MT5Adapter(http_client=http, signer=_signer())
+        await adapter.place_order(_request("ord-cc"))
+
+        first = asyncio.create_task(adapter.cancel_order("ord-cc"))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        second = asyncio.create_task(adapter.cancel_order("ord-cc"))
+        await asyncio.sleep(0)
+        cancel_event.set()
+
+        r1, r2 = await asyncio.gather(first, second)
+        assert r1.status is OrderStatus.CANCELLED
+        assert r1 == r2
+        # /signals/cancel was hit exactly once despite two concurrent
+        # cancel_order calls.
+        assert cancel_calls[0] == 1
+
+    _run(scenario())
+
+
+def test_cancel_filled_race_response_with_null_filled_quantity() -> None:
+    """A relay that returns FILLED with `filled_quantity: null`
+    must not raise; the adapter should coerce missing/null fields
+    to a safe default rather than crash.
+    """
+    async def scenario() -> None:
+        http = _FakeHttp([
+            HttpResponse(status=202, body=b'{"venue_order_id":"v"}', headers={}),
+            HttpResponse(
+                status=200,
+                body=b'{"status":"FILLED","filled_quantity":null,"average_fill_price":null}',
+                headers={},
+            ),
+        ])
+        adapter = MT5Adapter(http_client=http, signer=_signer())
+        await adapter.place_order(_request("ord-null"))
+        result = await adapter.cancel_order("ord-null")
+        # Did not raise; FILLED is reported with safe defaults.
+        assert result.status is OrderStatus.FILLED
+
+    _run(scenario())
+
+
+def test_place_order_cancellation_cleans_up_in_flight() -> None:
+    """If place_order is cancelled mid HTTP retry (asyncio task
+    cancellation), the in-flight slot must be cleared and any
+    waiting concurrent caller must observe a deterministic result
+    instead of awaiting forever.
+    """
+    async def scenario() -> None:
+        block_forever = asyncio.Event()
+
+        async def stalled_http(method, url, headers, body):
+            # Block until cancelled.
+            await block_forever.wait()
+            return HttpResponse(status=202, body=b'{}', headers={})
+
+        adapter = MT5Adapter(http_client=stalled_http, signer=_signer())
+
+        first = asyncio.create_task(adapter.place_order(_request("ord-cancel")))
+        # Let the first task park itself in the in-flight map.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        # Now a concurrent caller awaits the in-flight Future.
+        second = asyncio.create_task(adapter.place_order(_request("ord-cancel")))
+        await asyncio.sleep(0)
+
+        # Cancel the first task. The second must NOT hang forever.
+        first.cancel()
+        with pytest.raises((asyncio.CancelledError, Exception)):
+            await first
+        # The second caller should resolve to the synthetic
+        # "aborted" result the first task set on the future.
+        result = await asyncio.wait_for(second, timeout=2.0)
+        assert result.status is OrderStatus.REJECTED
+        assert "aborted" in (result.error or "")
+
+    _run(scenario())
+
+
 def test_get_open_orders_uses_lock_for_consistent_snapshot() -> None:
     """Sanity: even under no contention, get_open_orders returns a
     coherent snapshot list rather than iterating the live dict.
