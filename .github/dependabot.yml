@@ -1,0 +1,73 @@
+# Dependabot configuration for AlphaAxiom (L4 Satellite Trading).
+#
+# Covers the three ecosystems:
+#   1. npm under /money-machine (Next.js + Tauri trading dashboard).
+#   2. pip under /money-machine/src-python (Python trading runtime,
+#      MT5/Bybit/EVM adapters, signing primitives).
+#   3. github-actions for workflow pins.
+#
+# Trading code lives in money-machine/src-python/, which AGENTS.md flags
+# as requiring maintainer review for any change. Dependabot PRs that
+# touch this directory should still be reviewed; the auto-merge is NOT
+# enabled.
+
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/money-machine"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "chore(deps-dev)"
+    labels:
+      - "dependencies"
+      - "money-machine"
+    groups:
+      production-minor-patch:
+        dependency-type: "production"
+        update-types:
+          - "minor"
+          - "patch"
+      development-minor-patch:
+        dependency-type: "development"
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "pip"
+    directory: "/money-machine/src-python"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - "dependencies"
+      - "trading-runtime"
+    groups:
+      python-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(ci)"
+    labels:
+      - "dependencies"
+      - "ci"
