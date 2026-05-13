@@ -97,6 +97,75 @@ class PaperAdapter(ExecutionAdapter):
             )
         self._mark_prices[symbol] = value
 
+    def reset(self, *, initial_balance: Optional[float] = None) -> None:
+        """Wipe order history, positions, and balance back to a
+        clean state. Mark prices and the configured cost models
+        are preserved.
+
+        Used by short-lived simulations (RL training, walk-forward
+        sweeps) that need a fresh adapter at the top of every
+        episode without paying the cost of re-instantiation. The
+        public method replaces the previous pattern of poking at
+        the underscore-prefixed attributes from outside, which
+        broke encapsulation and made the adapter fragile to
+        bookkeeping changes.
+        """
+        if initial_balance is not None:
+            if initial_balance < 0:
+                raise AdapterError(
+                    f"initial_balance must be >= 0, got {initial_balance!r}"
+                )
+            self._balance = float(initial_balance)
+        self._positions.clear()
+        self._order_history.clear()
+        self._open_orders.clear()
+
+    def place_order_sync(self, request: OrderRequest) -> OrderResult:
+        """Synchronous market-order entry point for non-async hosts.
+
+        Provides the same fill logic as `place_order` without the
+        asyncio lock and without scheduling on the event loop.
+        Designed for tight loops (RL env step, vectorised
+        backtests) that would otherwise spin up a fresh event loop
+        on every call via `asyncio.run`.
+
+        Limitations: limit orders that would park as PENDING are
+        rejected here (PENDING management requires the lock and
+        process_open_orders to clear; use the async path instead).
+        """
+        cached = self._order_history.get(request.client_order_id)
+        if cached is not None:
+            return cached
+
+        error = self._validate_request(request)
+        if error is not None:
+            result = self._reject(request, error)
+            self._order_history[request.client_order_id] = result
+            return result
+
+        mark = self._mark_prices.get(request.symbol)
+        if mark is None:
+            result = self._reject(
+                request, f"no mark price set for {request.symbol}"
+            )
+            self._order_history[request.client_order_id] = result
+            return result
+
+        if request.order_type is OrderType.MARKET:
+            result = self._fill_market_locked(request, mark)
+        else:
+            if self._limit_can_fill(request, mark):
+                result = self._fill_limit_locked(request, mark)
+            else:
+                result = self._reject(
+                    request,
+                    "place_order_sync rejects unfillable LIMIT orders; "
+                    "use the async place_order path for PENDING management",
+                )
+
+        self._order_history[request.client_order_id] = result
+        return result
+
     async def process_open_orders(self) -> List[OrderResult]:
         """Re-evaluate every PENDING limit order against current marks.
 

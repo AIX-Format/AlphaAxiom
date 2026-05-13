@@ -7,19 +7,27 @@ Each action is translated into an order against an injected
 `PaperAdapter` (which already has the full execution semantics:
 slippage, commission, idempotency, balance bookkeeping). The
 observation is a window of recent OHLCV + a small set of
-indicators + position state.
+indicators + position state, normalised so it stays inside the
+declared Box bounds for any reasonable asset.
 
-The env is intentionally simple by design:
+Design notes the reviews surfaced and fixed:
 
-- Single-asset, single-position long-only-by-default. Going short
-  is supported when `allow_short=True`.
-- Discrete action space `{0: HOLD, 1: BUY, 2: SELL}`. Continuous
-  position sizing is a follow-up.
-- One step = one bar. Fills happen at the next bar's open (no
-  look-ahead), with the slippage/commission models defined on the
-  adapter.
-- `done` fires at end-of-data or when equity falls below
-  `min_equity_fraction * initial_equity`.
+- Indicators are computed ONCE in `__init__` and indexed during
+  `step`. The previous version recomputed RSI/EMA/ATR over the
+  full historical slice on every step, giving the environment
+  O(T^2) cost for an episode of length T.
+- The fill path uses `PaperAdapter.place_order_sync` so there is
+  no `asyncio.run` overhead per step (and the env runs cleanly
+  inside an existing event loop, e.g. a Jupyter cell or an RLlib
+  worker).
+- `PaperAdapter.reset()` replaces the prior pattern of poking at
+  the adapter's underscore attributes, keeping the env honest
+  about the adapter contract.
+- Position is observed as a scale-invariant weight
+  `(position * mark) / equity` so the same env works for BTC and
+  SHIB without busting the Box bounds.
+- A SELL with `allow_short=False` is capped to the current long's
+  notional so it cannot flip the position into a short.
 
 The whole module imports only `gymnasium`, `numpy`, and `pandas`.
 No torch, no stable_baselines3 - those land in the agent slice.
@@ -28,6 +36,7 @@ No torch, no stable_baselines3 - those land in the agent slice.
 from __future__ import annotations
 
 import logging
+import math
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
@@ -61,10 +70,10 @@ class ObservationConfig:
 
     The observation is a 1-D array assembled from:
       - `window_size` rolling closes, normalised by the latest close
-      - 3 indicators on the latest bar: RSI(14), EMA(20)/close,
+      - 3 indicators on the latest bar: RSI(14)/100, EMA(20)/close-1,
         ATR(14)/close
-      - 2 position-state scalars: signed position (units of base),
-        equity normalised by `initial_equity`
+      - 2 position-state scalars: position weight (notional / equity),
+        equity / initial_equity - 1
 
     Total dimension = window_size + 5. Float32 throughout.
     """
@@ -107,25 +116,7 @@ ACTION_SELL = 2
 
 
 class TradingEnv(gym.Env):
-    """Single-asset bar-stepped trading env.
-
-    Constructor:
-      data:    OHLCV DataFrame with columns
-               ['open', 'high', 'low', 'close', 'volume'] indexed
-               by timestamp.
-      adapter: PaperAdapter (or any ExecutionAdapter that supports
-               set_mark_price + place_order).
-      config:  EnvConfig.
-      reward:  RewardFunction. Defaults to `PnLReward(as_return=True)`.
-
-    Spaces:
-      action_space:      Discrete(3)
-      observation_space: Box(window_size + 5,), float32, range [-10, 10]
-
-    The Box bounds are intentionally wide because the observation
-    is a normalised mix of magnitudes; clipping inside the env
-    would mask agent edge cases.
-    """
+    """Single-asset bar-stepped trading env."""
 
     metadata = {"render_modes": ["human"]}
 
@@ -155,6 +146,18 @@ class TradingEnv(gym.Env):
                 f"data has only {len(self._data)} rows; need at least "
                 f"{self.config.warmup_bars + 2} for one step after warm-up"
             )
+
+        # Precompute the static indicator series once. Indexing
+        # them during step keeps each tick O(1) instead of
+        # recomputing over the full historical slice (O(T) per step
+        # which was O(T^2) over a full episode).
+        self._indicator_cache = self._precompute_indicators()
+
+        # Numpy views for the hot path in step / observation
+        # assembly. These never change after construction.
+        self._open_arr = self._data["open"].to_numpy(dtype=np.float64)
+        self._close_arr = self._data["close"].to_numpy(dtype=np.float64)
+        self._n_bars = len(self._data)
 
         self.action_space = spaces.Discrete(3)
         obs_dim = self.config.observation.window_size + 5
@@ -189,11 +192,9 @@ class TradingEnv(gym.Env):
         self._cumulative_steps = 0
         self._step_id = 0
 
-        # Reset the paper adapter to a clean balance + mark.
-        self.adapter._balance = self._initial_equity  # type: ignore[attr-defined]
-        self.adapter._positions.clear()  # type: ignore[attr-defined]
-        self.adapter._order_history.clear()  # type: ignore[attr-defined]
-        self.adapter._open_orders.clear()  # type: ignore[attr-defined]
+        # Use the adapter's public reset hook instead of reaching
+        # into its underscore-prefixed state.
+        self.adapter.reset(initial_balance=self._initial_equity)
         self._set_mark(self._current_bar)
 
         obs = self._build_observation()
@@ -218,8 +219,8 @@ class TradingEnv(gym.Env):
         # Advance to the bar where the order would fill (next bar's
         # open). The adapter is given the next-bar open as the mark
         # so its market-order semantics fill there.
-        next_bar = min(self._current_bar + 1, len(self._data) - 1)
-        next_open = float(self._data["open"].iloc[next_bar])
+        next_bar = min(self._current_bar + 1, self._n_bars - 1)
+        next_open = float(self._open_arr[next_bar])
         self.adapter.set_mark_price(self.config.symbol, next_open)
 
         # Translate the discrete action into an OrderRequest.
@@ -229,10 +230,7 @@ class TradingEnv(gym.Env):
         # Advance the env clock and mark-to-market at the new bar's
         # close so the reward sees a coherent equity transition.
         self._current_bar = next_bar
-        close_price = float(self._data["close"].iloc[self._current_bar])
-        # `adapter.get_balance()` is async; we know PaperAdapter's
-        # internal _balance is sync and consistent, so read it
-        # directly. A more general adapter wrapper is a follow-up.
+        close_price = float(self._close_arr[self._current_bar])
         self._equity = float(self.adapter._balance) + self._position_value(  # type: ignore[attr-defined]
             close_price
         )
@@ -265,7 +263,7 @@ class TradingEnv(gym.Env):
 
         # Episode termination conditions.
         terminated = self._equity < self._initial_equity * self.config.min_equity_fraction
-        truncated = self._current_bar >= len(self._data) - 1
+        truncated = self._current_bar >= self._n_bars - 1
 
         self._cumulative_steps += 1
         self._step_id += 1
@@ -286,57 +284,74 @@ class TradingEnv(gym.Env):
     # Observation + action helpers
     # ------------------------------------------------------------------
 
+    def _precompute_indicators(self) -> Dict[str, np.ndarray]:
+        """Run RSI/EMA/ATR once over the full historical series.
+
+        Each indicator returns a Series aligned to the input index;
+        we drop them straight to numpy arrays so `_build_observation`
+        is a constant-time lookup.
+        """
+        cfg = self.config.observation
+        close = self._data["close"]
+        high = self._data["high"]
+        low = self._data["low"]
+        rsi_series = rsi(close, period=cfg.rsi_period)
+        ema_series = ema(close, period=cfg.ema_period)
+        atr_series = atr(high, low, close, period=cfg.atr_period)
+        return {
+            "rsi": rsi_series.to_numpy(dtype=np.float64),
+            "ema": ema_series.to_numpy(dtype=np.float64),
+            "atr": atr_series.to_numpy(dtype=np.float64),
+        }
+
     def _build_observation(self) -> np.ndarray:
         cfg = self.config.observation
         end = self._current_bar + 1
         start = max(0, end - cfg.window_size)
-        closes = self._data["close"].iloc[start:end].to_numpy(dtype=np.float32)
-        # Right-pad with the leftmost value if we are early in the
-        # series (should not happen after warmup_bars but defensive).
+        closes = self._close_arr[start:end].astype(np.float32)
         if len(closes) < cfg.window_size:
             pad = np.full(cfg.window_size - len(closes), closes[0], dtype=np.float32)
             closes = np.concatenate([pad, closes])
-        latest = closes[-1] if closes[-1] != 0 else 1.0
-        normalised = closes / latest - 1.0  # mean 0, scale ~ 0.01-0.05
+        latest = float(closes[-1]) if closes[-1] != 0 else 1.0
+        normalised = closes / latest - 1.0
 
-        # Indicators on the full historical slice up to current bar.
-        hist = self._data.iloc[: end]
-        rsi_value = self._safe_last(rsi(hist["close"], period=cfg.rsi_period), 50.0) / 100.0
-        ema_ratio = (
-            self._safe_last(ema(hist["close"], period=cfg.ema_period), latest) / latest
-            - 1.0
-        )
-        atr_ratio = (
-            self._safe_last(atr(hist["high"], hist["low"], hist["close"], period=cfg.atr_period), 0.0)
-            / latest
-        )
+        bar = self._current_bar
+        rsi_v = self._safe_indicator(self._indicator_cache["rsi"], bar, fallback=50.0) / 100.0
+        ema_v = self._safe_indicator(self._indicator_cache["ema"], bar, fallback=latest)
+        atr_v = self._safe_indicator(self._indicator_cache["atr"], bar, fallback=0.0)
+        ema_ratio = (ema_v / latest) - 1.0 if latest > 0 else 0.0
+        atr_ratio = atr_v / latest if latest > 0 else 0.0
 
-        position_norm = float(self._position)
+        # Position is observed as a SCALE-INVARIANT weight:
+        # notional in equity-currency / equity. For BTC at 50k with
+        # a 0.05 long on a 10k account the weight is 0.25; for SHIB
+        # at 1e-5 with 5e7 units on the same account the weight is
+        # also 0.5. Raw position quantity would clip immediately
+        # for assets with extreme unit sizes.
+        if self._equity > 0:
+            position_weight = (self._position * latest) / self._equity
+        else:
+            position_weight = 0.0
         equity_norm = (self._equity / self._initial_equity) - 1.0
 
         obs = np.concatenate(
             [
                 normalised.astype(np.float32),
                 np.array(
-                    [rsi_value, ema_ratio, atr_ratio, position_norm, equity_norm],
+                    [rsi_v, ema_ratio, atr_ratio, position_weight, equity_norm],
                     dtype=np.float32,
                 ),
             ]
         )
-        # Clip to the declared Box bounds so a one-off numerical
-        # outlier (e.g. a stale indicator NaN coerced through
-        # _safe_last) cannot violate the observation_space contract.
         return np.clip(obs, -10.0, 10.0)
 
     @staticmethod
-    def _safe_last(series: pd.Series, fallback: float) -> float:
-        try:
-            value = float(series.iloc[-1])
-        except (IndexError, KeyError, ValueError, TypeError):
-            return fallback
-        if not np.isfinite(value):
-            return fallback
-        return value
+    def _safe_indicator(arr: np.ndarray, bar: int, *, fallback: float) -> float:
+        if 0 <= bar < arr.shape[0]:
+            value = arr[bar]
+            if not math.isnan(value) and not math.isinf(value):
+                return float(value)
+        return fallback
 
     def _apply_action(
         self, action: int, *, notional: float, mark: float
@@ -352,9 +367,17 @@ class TradingEnv(gym.Env):
         if action == ACTION_BUY:
             side = OrderSide.BUY
         else:  # ACTION_SELL
-            if self._position <= 0 and not self.config.allow_short:
-                # Cannot open a short when shorts are disabled.
-                return {"status": "BLOCKED_SHORT_DISABLED"}
+            if not self.config.allow_short:
+                if self._position <= 0:
+                    # Cannot open a short when shorts are disabled.
+                    return {"status": "BLOCKED_SHORT_DISABLED"}
+                # Cap notional to the current long's value so the
+                # SELL closes (or partially closes) the position
+                # without flipping it into a short.
+                max_close_notional = self._position * mark
+                if max_close_notional <= 0:
+                    return {"status": "BLOCKED_SHORT_DISABLED"}
+                notional = min(notional, max_close_notional)
             side = OrderSide.SELL
 
         request = OrderRequest(
@@ -365,14 +388,10 @@ class TradingEnv(gym.Env):
             notional=float(notional),
         )
 
-        # PaperAdapter rejects oversized BUY if balance is short.
-        # `get_balance` is async but we can use a synchronous shim:
-        # the test suite uses asyncio.run; here we drive the call
-        # via the adapter's internal sync state for performance.
-        # A cleaner async wrapper is the natural follow-up.
-        import asyncio
-
-        result = asyncio.run(self.adapter.place_order(request))
+        # Synchronous fill path: no asyncio.run, no event-loop
+        # creation, and works inside an already-running loop (RLlib,
+        # Jupyter, asyncio test harnesses).
+        result = self.adapter.place_order_sync(request)
         if result.status == OrderStatus.FILLED:
             qty = float(result.filled_quantity or 0.0)
             if side is OrderSide.BUY:
@@ -391,7 +410,7 @@ class TradingEnv(gym.Env):
         return float(self._position) * float(price)
 
     def _set_mark(self, bar_idx: int) -> None:
-        price = float(self._data["close"].iloc[bar_idx])
+        price = float(self._close_arr[bar_idx])
         if price > 0:
             self.adapter.set_mark_price(self.config.symbol, price)
 

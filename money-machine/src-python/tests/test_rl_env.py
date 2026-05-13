@@ -259,6 +259,30 @@ def test_env_blocks_short_when_disallowed() -> None:
     assert info["fill"]["status"] == "BLOCKED_SHORT_DISABLED"
 
 
+def test_sell_caps_to_long_value_when_shorts_disallowed() -> None:
+    """A SELL with notional bigger than the current long must close
+    the long without flipping into a short."""
+    env = _build_env(
+        closes=[100.0 + i for i in range(40)],
+        position_fraction=0.05,  # smaller BUY so the long is small
+        allow_short=False,
+        window_size=8,
+        warmup_bars=20,
+    )
+    env.reset()
+    env.step(ACTION_BUY)
+    long_before = env._position
+    assert long_before > 0
+    # Now request many SELL ticks with a position_fraction of 5%
+    # equity each. The cap inside _apply_action must keep the
+    # position >= 0 at every step.
+    for _ in range(5):
+        _, _, _, _, info = env.step(ACTION_SELL)
+        assert env._position >= -1e-9, (
+            f"position went short: {env._position}; fill={info['fill']}"
+        )
+
+
 def test_env_truncates_at_end_of_data() -> None:
     n = 30
     env = _build_env(
@@ -334,6 +358,112 @@ def test_env_rejects_too_short_data() -> None:
 # ---------------------------------------------------------------------------
 # Gymnasium standard check
 # ---------------------------------------------------------------------------
+
+
+def test_env_runs_inside_running_event_loop() -> None:
+    """The env must not call `asyncio.run` per step; otherwise it
+    blows up when used inside a running event loop (RLlib worker,
+    Jupyter, async test harness). Drive a few steps from inside an
+    async function and confirm no `RuntimeError` is raised.
+    """
+    import asyncio
+
+    env = _build_env(closes=[100.0 + i for i in range(40)], window_size=8, warmup_bars=20)
+
+    async def drive() -> int:
+        env.reset()
+        # 5 alternating actions inside an active event loop.
+        for action in [ACTION_BUY, ACTION_HOLD, ACTION_SELL, ACTION_HOLD, ACTION_BUY]:
+            env.step(action)
+        return env._cumulative_steps
+
+    steps = asyncio.run(drive())
+    assert steps == 5
+
+
+def test_indicators_are_precomputed_once() -> None:
+    """A pure observation pull after `reset` should hit the
+    precomputed indicator arrays, not recompute them. We instrument
+    the rsi function in `engine.rl.env` to assert it is NOT called
+    on each step.
+    """
+    import engine.rl.env as env_module
+
+    env = _build_env(closes=[100.0 + i for i in range(40)], window_size=8, warmup_bars=20)
+    env.reset()
+
+    call_count = [0]
+    original = env_module.rsi
+
+    def counting(*args, **kwargs):
+        call_count[0] += 1
+        return original(*args, **kwargs)
+
+    env_module.rsi = counting  # type: ignore[assignment]
+    try:
+        for _ in range(10):
+            env.step(ACTION_HOLD)
+    finally:
+        env_module.rsi = original  # type: ignore[assignment]
+
+    # Zero calls during the step loop: indicators are read from the
+    # cached numpy arrays.
+    assert call_count[0] == 0
+
+
+def test_position_observation_is_scale_invariant_weight() -> None:
+    """Position in the observation must be `(position * price) /
+    equity`, not the raw quantity. A BTC long of 0.1 at price 50k
+    on a 10k equity should show position weight ≈ 0.5; a SHIB long
+    of 5e7 at price 1e-5 on the same equity should also show ≈ 0.5.
+    """
+    # BTC-like asset: high price, small position size.
+    closes_btc = [50_000.0] * 40
+    env_btc = _build_env(closes=closes_btc, window_size=8, warmup_bars=20, position_fraction=0.5)
+    env_btc.reset()
+    env_btc.step(ACTION_BUY)
+    obs_btc = env_btc._build_observation()
+    pos_weight_btc = float(obs_btc[-2])
+
+    # SHIB-like asset: tiny price, huge position size.
+    closes_shib = [1e-5] * 40
+    env_shib = _build_env(closes=closes_shib, window_size=8, warmup_bars=20, position_fraction=0.5)
+    env_shib.reset()
+    env_shib.step(ACTION_BUY)
+    obs_shib = env_shib._build_observation()
+    pos_weight_shib = float(obs_shib[-2])
+
+    # Both should land near 0.5 (50% of equity deployed), regardless
+    # of the asset's unit scale. The fixture has zero slippage and
+    # zero commission so the math is exact up to float rounding.
+    assert pos_weight_btc == pytest.approx(0.5, abs=1e-3)
+    assert pos_weight_shib == pytest.approx(0.5, abs=1e-3)
+
+
+def test_paper_adapter_reset_clears_state() -> None:
+    """The new `PaperAdapter.reset()` replaces the old pattern of
+    poking at `_balance` / `_positions` / `_order_history` from
+    outside. Verify it does what the env relies on.
+    """
+    import asyncio
+
+    from engine.adapters import OrderRequest, OrderSide, OrderType
+
+    adapter = PaperAdapter(initial_balance=5_000.0)
+    adapter.set_mark_price("BTC/USDT", 50_000.0)
+    asyncio.run(adapter.place_order(OrderRequest(
+        client_order_id="x",
+        symbol="BTC/USDT",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        notional=500.0,
+    )))
+    assert asyncio.run(adapter.get_balance()) < 5_000.0
+
+    adapter.reset(initial_balance=10_000.0)
+    assert asyncio.run(adapter.get_balance()) == 10_000.0
+    assert asyncio.run(adapter.get_positions()) == {}
+    assert asyncio.run(adapter.get_open_orders()) == []
 
 
 def test_env_passes_gymnasium_env_checker() -> None:
