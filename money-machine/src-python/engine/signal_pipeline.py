@@ -35,6 +35,7 @@ from .adapters import (
     OrderStatus,
     OrderType,
 )
+from .contracts import ContractValidator, OrderIntentContract
 from .position_sizing import fixed_fractional
 from .risk_shield import (
     PortfolioState,
@@ -211,6 +212,7 @@ class SignalPipeline:
 
         try:
             signal = self.strategy.generate_signal(df)
+            ContractValidator.signal(signal)
         except Exception as exc:
             logger.error(
                 "Strategy %s raised on generate_signal: %s",
@@ -225,6 +227,7 @@ class SignalPipeline:
                 strategy=getattr(self.strategy, "name", ""),
                 reasoning=f"strategy raised: {exc}",
             )
+            ContractValidator.signal(fallback)
             return PipelineResult(
                 signal=fallback,
                 risk_decision=RiskDecision(
