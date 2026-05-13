@@ -13,9 +13,9 @@ def load_config() -> Dict[str, Any]:
     
     config = {
         # Default values
-        "initial_balance": 10000.0,
-        "max_risk_per_trade": 0.02,  # 2%
-        "max_daily_loss": 0.05,  # 5%
+        "initial_balance": float(os.environ.get("INITIAL_BALANCE", "10000")),
+        "max_risk_per_trade": float(os.environ.get("MAX_RISK_PER_TRADE", "0.02")),  # 2%
+        "max_daily_loss": float(os.environ.get("MAX_DAILY_LOSS", "0.05")),  # 5%
         
         # Exchange configuration
         "exchange": {
