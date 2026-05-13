@@ -63,8 +63,8 @@ PRIVATE_KEY = bytes.fromhex(
 )
 ACCOUNT = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
 
-TOKEN_A = "0xAAaAaaAaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa"
-TOKEN_B = "0xBbbBBBbbbBBBbbbBbbBbBBBb000000000000bBBb"
+TOKEN_A = "0xAAaAaaAaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa"  # noqa: S105 - public test fixture address
+TOKEN_B = "0xBbbBBBbbbBBBbbbBbbBbBBBb000000000000bBBb"  # noqa: S105 - public test fixture address
 
 
 class _FakeRpc:
@@ -89,12 +89,15 @@ class _FakeRpc:
 
 
 def _request(client_id: str = "ord-1", **overrides: Any) -> OrderRequest:
+    """Build a default SELL request: spend 1 BASE for an expected
+    1000 QUOTE. Tests override fields as needed.
+    """
     base: Dict[str, Any] = dict(
         client_order_id=client_id,
         symbol="TOKA/TOKB",
         side=OrderSide.SELL,
         order_type=OrderType.MARKET,
-        notional=1.0,  # 1 TOKA
+        quantity=1.0,  # 1 BASE token
         strategy="evm-test",
         metadata={
             "from_address": TOKEN_A,
@@ -331,8 +334,11 @@ def test_slippage_bps_rejects_out_of_range() -> None:
             "expected_amount_out": 1.0,
             "slippage_bps": 20_000,  # > 100%
         })
-        with pytest.raises(AdapterError):
-            await adapter.place_order(req)
+        # The adapter's "never raise on routine failure" contract
+        # now converts this AdapterError into a REJECTED result.
+        result = await adapter.place_order(req)
+        assert result.status is OrderStatus.REJECTED
+        assert "slippage_bps" in (result.error or "")
 
     _run(scenario())
 
@@ -444,6 +450,158 @@ def test_cancel_order_marks_local_state_but_warns_chain_may_mine() -> None:
         cancelled = await adapter.cancel_order("ord-c")
         assert cancelled.status is OrderStatus.CANCELLED
         assert "chain may still mine" in (cancelled.metadata.get("warning") or "")
+
+    _run(scenario())
+
+
+def test_buy_uses_reversed_path_and_quote_notional() -> None:
+    """BUY spends QUOTE (to_address) to acquire BASE (from_address);
+    the swap path must be [to_address, from_address], the
+    amount_in must come from notional in QUOTE units, and
+    amount_out_min must use BASE decimals. Encoding it as the
+    same direction as SELL would execute the opposite trade.
+    """
+    async def scenario() -> None:
+        rpc = _FakeRpc({
+            "eth_getTransactionCount": "0x0",
+            "eth_gasPrice": "0x1",
+            "eth_sendRawTransaction": "0xtxbuy",
+        })
+        adapter = EVMAdapter(
+            rpc=rpc, private_key=PRIVATE_KEY, account_address=ACCOUNT,
+            clock=lambda: 0.0,
+        )
+        # BUY 1 BASE for 1.0 QUOTE notional. Tokens have different
+        # decimals so we can check scaling is side-aware.
+        req = _request(
+            client_id="buy-1",
+            side=OrderSide.BUY,
+            quantity=None,
+            notional=1.0,
+            metadata={
+                "from_address": TOKEN_A,
+                "to_address": TOKEN_B,
+                "from_decimals": 18,
+                "to_decimals": 6,  # USDC-like quote
+                "expected_amount_out": 1.0,
+                "slippage_bps": 50,
+            },
+        )
+        result = await adapter.place_order(req)
+        assert result.status is OrderStatus.PENDING
+        # amount_in is notional * 10^to_decimals (QUOTE units).
+        assert result.metadata["amount_in_wei"] == 1 * 10**6
+        # input_address is QUOTE (to_address), output_address is BASE.
+        assert result.metadata["input_address"] == TOKEN_B
+        assert result.metadata["output_address"] == TOKEN_A
+        assert result.metadata["side"] == "BUY"
+        # amount_out_min uses BASE decimals (from_decimals=18).
+        expected_min = 10**18 - 10**18 * 50 // 10_000
+        assert result.metadata["amount_out_min_wei"] == expected_min
+
+    _run(scenario())
+
+
+def test_buy_without_notional_is_rejected() -> None:
+    """BUY needs notional in QUOTE units; quantity alone needs a
+    price the adapter does not know.
+    """
+    async def scenario() -> None:
+        adapter = EVMAdapter(
+            rpc=_FakeRpc({}), private_key=PRIVATE_KEY, account_address=ACCOUNT
+        )
+        req = _request(
+            side=OrderSide.BUY,
+            quantity=1.0,
+            notional=None,
+        )
+        result = await adapter.place_order(req)
+        assert result.status is OrderStatus.REJECTED
+        assert "BUY" in (result.error or "")
+
+    _run(scenario())
+
+
+def test_sell_without_quantity_is_rejected() -> None:
+    async def scenario() -> None:
+        adapter = EVMAdapter(
+            rpc=_FakeRpc({}), private_key=PRIVATE_KEY, account_address=ACCOUNT
+        )
+        req = _request(
+            side=OrderSide.SELL,
+            quantity=None,
+            notional=1.0,
+        )
+        result = await adapter.place_order(req)
+        assert result.status is OrderStatus.REJECTED
+        assert "SELL" in (result.error or "")
+
+    _run(scenario())
+
+
+def test_missing_expected_amount_out_is_rejected() -> None:
+    """Without a quote or explicit amount_out_min the adapter would
+    have to default to 1 wei = unlimited slippage = sandwich
+    attack invitation. Reject the order instead.
+    """
+    async def scenario() -> None:
+        rpc = _FakeRpc({
+            "eth_getTransactionCount": "0x0",
+            "eth_gasPrice": "0x1",
+        })
+        adapter = EVMAdapter(
+            rpc=rpc, private_key=PRIVATE_KEY, account_address=ACCOUNT,
+            clock=lambda: 0.0,
+        )
+        req = _request(metadata={
+            "from_address": TOKEN_A,
+            "to_address": TOKEN_B,
+            # no expected_amount_out, no amount_out_min
+        })
+        result = await adapter.place_order(req)
+        assert result.status is OrderStatus.REJECTED
+        # The original AdapterError message is wrapped in
+        # "chain interaction failed: ..." so both fragments are
+        # visible to the caller.
+        assert "amount_out_min" in (result.error or "")
+
+    _run(scenario())
+
+
+def test_get_balance_handles_null_wei_response() -> None:
+    """Some RPC providers return null on the very first balance
+    query for a newly seen account. Must not crash; return 0.0.
+    """
+    async def scenario() -> None:
+        adapter = EVMAdapter(
+            rpc=_FakeRpc({"eth_getBalance": None}),
+            private_key=PRIVATE_KEY,
+            account_address=ACCOUNT,
+        )
+        assert (await adapter.get_balance()) == 0.0
+
+    _run(scenario())
+
+
+def test_gas_price_fallback_can_be_disabled_for_strict_chains() -> None:
+    """When the operator sets gas_price_fallback_wei=None the
+    adapter should refuse to size a transaction it cannot price,
+    instead of paying out of a stale hardcoded 20 gwei.
+    """
+    async def scenario() -> None:
+        async def boom_gas(method, params):
+            if method == "eth_gasPrice":
+                raise ConnectionError("rpc down")
+            return "0x0"
+
+        adapter = EVMAdapter(
+            rpc=boom_gas, private_key=PRIVATE_KEY, account_address=ACCOUNT,
+            clock=lambda: 0.0,
+            config=EVMAdapterConfig(gas_price_fallback_wei=None),
+        )
+        result = await adapter.place_order(_request("ord-nogas"))
+        assert result.status is OrderStatus.REJECTED
+        assert "gas price unavailable" in (result.error or "")
 
     _run(scenario())
 

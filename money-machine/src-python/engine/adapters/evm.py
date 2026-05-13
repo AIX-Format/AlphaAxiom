@@ -99,6 +99,12 @@ class EVMAdapterConfig:
     gas_limit: int = 300_000
     confirm_timeout_seconds: float = 60.0
     confirm_poll_seconds: float = 2.0
+    # Per-chain fallback gas price (wei) when eth_gasPrice fails.
+    # 20 gwei is reasonable for Ethereum mainnet but wildly wrong
+    # on L2s; surface as a config so the caller picks the right
+    # number for the chain they wired up. Set to None to disable
+    # the fallback and reject the order on RPC failure instead.
+    gas_price_fallback_wei: Optional[int] = 20 * 10**9
 
 
 # ---------------------------------------------------------------------------
@@ -124,18 +130,31 @@ class EVMAdapter(ExecutionAdapter):
     `place_order` builds an ERC-20-token swap (``swapExactTokensFor
     Tokens(amountIn, amountOutMin, path, to, deadline)``) given:
 
-      symbol     -> "FROM/TO", maps to a 2-hop path [FROM, TO].
-      side       -> BUY swaps TO into FROM, SELL swaps FROM into TO.
-      notional   -> in FROM units, scaled by the FROM decimals
-                    (passed via metadata['from_decimals'], defaults
-                    to 18).
-      metadata   -> may override `amount_out_min`, `gas_priority_gwei`,
-                    `path` for multi-hop routes.
+      symbol   -> "BASE/QUOTE" by convention. `metadata
+                  ['from_address']` is BASE, `metadata
+                  ['to_address']` is QUOTE.
+      side     -> BUY spends QUOTE to acquire BASE (path:
+                  [QUOTE, BASE]). SELL spends BASE to acquire
+                  QUOTE (path: [BASE, QUOTE]).
+      quantity -> in BASE units. Preferred for SELL.
+      notional -> in QUOTE units. Preferred for BUY.
 
-    The adapter does NOT discover token addresses; the caller passes
-    them through `metadata['from_address']` and `metadata
-    ['to_address']`. A higher-level routing layer is the right place
-    to map symbols to addresses.
+    Sizing rule:
+
+      SELL: amount_in comes from `quantity` (BASE units) scaled
+            by `from_decimals`. notional alone is rejected since
+            converting quote -> base needs a price the adapter
+            does not know.
+      BUY:  amount_in comes from `notional` (QUOTE units) scaled
+            by `to_decimals`. quantity alone is rejected.
+
+      metadata may override `amount_out_min`, `path`, and
+      `expected_amount_out` (in whole-output-token units).
+
+    The adapter does NOT discover token addresses; the caller
+    passes them through `metadata['from_address']` and
+    `metadata['to_address']`. A higher-level routing layer is the
+    right place to map symbols to addresses.
     """
 
     name = "evm"
@@ -194,7 +213,44 @@ class EVMAdapter(ExecutionAdapter):
 
             from_decimals = int(metadata.get("from_decimals", 18))
             to_decimals = int(metadata.get("to_decimals", 18))
-            amount_in = self._resolve_amount_in(request, from_decimals)
+            # Side-aware path and amount-in semantics. BUY spends
+            # QUOTE (to_address) to acquire BASE (from_address);
+            # SELL spends BASE to acquire QUOTE. Without this the
+            # adapter encoded BUY orders as if they were SELLs.
+            is_buy = request.side is OrderSide.BUY
+            if is_buy:
+                input_address = to_address
+                output_address = from_address
+                input_decimals = to_decimals
+                output_decimals = from_decimals
+                # BUY size lives in QUOTE units = notional.
+                if request.notional is None:
+                    result = self._rejected(
+                        request,
+                        "EVM BUY requires `notional` in QUOTE units; "
+                        "quantity alone needs a price the adapter does "
+                        "not know",
+                    )
+                    self._order_cache[request.client_order_id] = result
+                    return result
+                amount_in = int(float(request.notional) * 10**input_decimals)
+            else:
+                input_address = from_address
+                output_address = to_address
+                input_decimals = from_decimals
+                output_decimals = to_decimals
+                # SELL size lives in BASE units = quantity.
+                if request.quantity is None:
+                    result = self._rejected(
+                        request,
+                        "EVM SELL requires `quantity` in BASE units; "
+                        "notional alone needs a price the adapter does "
+                        "not know",
+                    )
+                    self._order_cache[request.client_order_id] = result
+                    return result
+                amount_in = int(float(request.quantity) * 10**input_decimals)
+
             if amount_in <= 0:
                 result = self._rejected(
                     request, "could not resolve a positive amount_in"
@@ -204,21 +260,29 @@ class EVMAdapter(ExecutionAdapter):
 
             try:
                 amount_out_min = await self._compute_amount_out_min(
-                    request, amount_in, from_address, to_address, metadata, to_decimals
+                    request,
+                    amount_in,
+                    input_address,
+                    output_address,
+                    metadata,
+                    output_decimals,
                 )
                 tx_unsigned = await self._build_swap_tx(
                     amount_in=amount_in,
                     amount_out_min=amount_out_min,
-                    from_address=from_address,
-                    to_address=to_address,
+                    input_address=input_address,
+                    output_address=output_address,
                     metadata=metadata,
                     client_order_id=request.client_order_id,
                 )
                 signed_hex = self._sign_tx(tx_unsigned)
                 tx_hash = await self.rpc("eth_sendRawTransaction", [signed_hex])
-            except AdapterError:
-                raise
             except Exception as exc:
+                # Includes AdapterError. The adapter contract is
+                # "never raise on routine failure"; even our own
+                # AdapterError (missing quote, gas price
+                # unavailable) is a routine reject in the order
+                # path and must surface as OrderResult(REJECTED).
                 logger.error("EVM place_order failure: %s", exc)
                 result = self._rejected(request, f"chain interaction failed: {exc}")
                 self._order_cache[request.client_order_id] = result
@@ -231,13 +295,16 @@ class EVMAdapter(ExecutionAdapter):
                 side=request.side,
                 order_type=request.order_type,
                 status=OrderStatus.PENDING,
-                requested_quantity=float(amount_in) / 10**from_decimals,
+                requested_quantity=float(amount_in) / 10**input_decimals,
                 metadata={
                     "tx_hash": str(tx_hash),
                     "amount_in_wei": int(amount_in),
                     "amount_out_min_wei": int(amount_out_min),
+                    "input_address": input_address,
+                    "output_address": output_address,
                     "from_address": from_address,
                     "to_address": to_address,
+                    "side": request.side.value,
                     "nonce": tx_unsigned["nonce"],
                 },
             )
@@ -299,18 +366,27 @@ class EVMAdapter(ExecutionAdapter):
         """Native-token balance of the operator account.
 
         Returns the value in whole units (ether for ETH-style
-        chains). Returns 0.0 if the RPC fails so the pipeline can
-        still produce a result.
+        chains). Returns 0.0 on any failure (RPC error, malformed
+        response, null payload) so the pipeline can still produce
+        a result.
         """
         try:
             wei = await self.rpc("eth_getBalance", [self.account_address, "latest"])
         except Exception as exc:
             logger.warning("eth_getBalance failed: %s", exc)
             return 0.0
+        if wei is None:
+            return 0.0
         try:
-            return int(wei, 16) / 10**18 if isinstance(wei, str) else float(wei) / 10**18
+            if isinstance(wei, str):
+                # Be tolerant of 0x-prefixed and bare hex strings; some
+                # RPC providers omit the 0x on small values.
+                value = int(wei, 16) if wei.startswith(("0x", "0X")) else int(wei, 16)
+            else:
+                value = int(wei)
         except (TypeError, ValueError):
             return 0.0
+        return float(value) / 10**18
 
     async def wait_for_receipt(
         self, client_order_id: str
@@ -350,13 +426,13 @@ class EVMAdapter(ExecutionAdapter):
         *,
         amount_in: int,
         amount_out_min: int,
-        from_address: str,
-        to_address: str,
+        input_address: str,
+        output_address: str,
         metadata: Dict[str, Any],
         client_order_id: str,
     ) -> Dict[str, Any]:
         deadline = int(self.clock()) + self.config.deadline_seconds
-        path = metadata.get("path") or [from_address, to_address]
+        path = metadata.get("path") or [input_address, output_address]
         if len(path) < 2:
             raise AdapterError("swap path must have at least 2 hops")
 
@@ -399,37 +475,59 @@ class EVMAdapter(ExecutionAdapter):
         try:
             raw = await self.rpc("eth_gasPrice", [])
         except Exception as exc:
-            logger.warning("eth_gasPrice failed: %s; falling back to 20 gwei", exc)
-            return 20 * 10**9
+            return self._gas_fallback(reason=f"eth_gasPrice raised: {exc}")
         try:
             return int(raw, 16) if isinstance(raw, str) else int(raw)
         except (TypeError, ValueError):
-            return 20 * 10**9
+            return self._gas_fallback(reason=f"eth_gasPrice returned {raw!r}")
+
+    def _gas_fallback(self, *, reason: str) -> int:
+        fallback = self.config.gas_price_fallback_wei
+        if fallback is None or fallback <= 0:
+            raise AdapterError(
+                f"gas price unavailable and no fallback configured ({reason})"
+            )
+        logger.warning(
+            "Using configured gas-price fallback %d wei: %s", fallback, reason
+        )
+        return int(fallback)
 
     async def _compute_amount_out_min(
         self,
         request: OrderRequest,
         amount_in: int,
-        from_address: str,
-        to_address: str,
+        input_address: str,
+        output_address: str,
         metadata: Dict[str, Any],
-        to_decimals: int,
+        output_decimals: int,
     ) -> int:
-        # Explicit override wins; otherwise derive from a quoted
-        # expected output (metadata['expected_amount_out']) and
-        # apply the slippage tolerance.
+        """Pick a slippage-protected minimum output amount.
+
+        Hard requirement: either `metadata['amount_out_min']` or
+        `metadata['expected_amount_out']` MUST be set. Defaulting
+        to 1 wei would be equivalent to accepting 100% slippage,
+        which is a sandwich-attack invitation. The caller's
+        higher-level quoting layer (1inch, on-chain getAmountsOut,
+        a cached oracle) is responsible for supplying one of these
+        before the order reaches the adapter.
+        """
         explicit = metadata.get("amount_out_min")
         if explicit is not None:
             return int(explicit)
         expected = metadata.get("expected_amount_out")
         if expected is None:
-            # No quote available; default to 1 wei so the swap
-            # still proceeds and only reverts on truly catastrophic
-            # slippage. Callers SHOULD provide a quote.
-            return 1
-        expected_int = int(float(expected) * 10**to_decimals) if isinstance(
-            expected, float
-        ) else int(expected)
+            raise AdapterError(
+                "EVM swap requires metadata['amount_out_min'] or "
+                "metadata['expected_amount_out']; defaulting to 1 wei "
+                "would allow unbounded slippage / sandwich attacks"
+            )
+        try:
+            expected_float = float(expected)
+        except (TypeError, ValueError) as exc:
+            raise AdapterError(
+                f"expected_amount_out must be numeric, got {expected!r}"
+            ) from exc
+        expected_int = int(expected_float * 10**output_decimals)
         bps = int(metadata.get("slippage_bps", self.config.slippage_bps))
         if bps < 0 or bps > 10000:
             raise AdapterError(f"slippage_bps must be in [0, 10000], got {bps}")
