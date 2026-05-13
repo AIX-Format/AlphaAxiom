@@ -60,7 +60,8 @@ pub fn run() {
             disable_keep_alive,
             store_api_key,
             get_api_key,
-            delete_api_key
+            delete_api_key,
+            get_ipc_auth_token
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -173,4 +174,47 @@ fn delete_api_key(key_name: String) -> Result<String, String> {
 
     log::info!("🗑️ Deleted API key: {}", key_name);
     Ok(format!("Key '{}' deleted", key_name))
+}
+
+// ============================================================
+// IPC AUTH TOKEN (Rust <-> Python sidecar shared secret)
+// ============================================================
+//
+// Returns the secret used to authenticate every TCP IPC request to
+// the Python trading engine. The token lives in the OS keychain under
+// service "money-machine" / account "ipc-auth-token". If it does not
+// exist yet (first launch on a clean machine), one is generated with
+// 32 bytes of OS-grade randomness and persisted. Subsequent calls are
+// constant-time lookups, no rotation.
+//
+// The Python sidecar reads the same keychain entry (via the `keyring`
+// Python package) when the IPC_AUTH_TOKEN env var is unset, so both
+// sides converge on the same secret without copying it through dev
+// dotfiles. Callers should treat the return value as a credential.
+
+const IPC_AUTH_ACCOUNT: &str = "ipc-auth-token";
+
+fn ensure_ipc_token() -> Result<String, String> {
+    let entry =
+        Entry::new(SERVICE_NAME, IPC_AUTH_ACCOUNT).map_err(|e| format!("Keyring error: {}", e))?;
+
+    match entry.get_password() {
+        Ok(token) if !token.is_empty() => Ok(token),
+        _ => {
+            use rand::RngCore;
+            let mut bytes = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut bytes);
+            let token = hex::encode(bytes);
+            entry
+                .set_password(&token)
+                .map_err(|e| format!("Failed to persist IPC token: {}", e))?;
+            log::info!("Provisioned a fresh IPC auth token in the OS keychain");
+            Ok(token)
+        }
+    }
+}
+
+#[tauri::command]
+fn get_ipc_auth_token() -> Result<String, String> {
+    ensure_ipc_token()
 }
