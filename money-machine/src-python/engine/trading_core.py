@@ -3,37 +3,81 @@ Core trading engine with CCXT integration
 """
 
 import asyncio
-from datetime import datetime
+from datetime import date, datetime, timezone
 from typing import Dict, List, Optional, Any
 import os
 
 
 class Portfolio:
-    """Manages portfolio state, balance, and positions"""
-    
+    """Manages portfolio state, balance, and positions.
+
+    Tracks the running totals the risk shield needs:
+      - balance: current equity.
+      - high_water_mark(): the all-time peak balance, lazily updated
+        on each balance read so it never drifts.
+      - daily_pnl(): realized PnL accumulated since UTC midnight.
+        Resets the moment the calling clock crosses into a new day.
+    """
+
     def __init__(self, initial_balance: float = 10000.0):
         self.balance = initial_balance
         self.trades: List[Dict] = []
         self.positions: Dict[str, Any] = {}
-    
+        self._high_water_mark = float(initial_balance)
+        self._daily_pnl = 0.0
+        self._daily_pnl_day: Optional[date] = None
+
     def get_balance(self) -> float:
+        # Touching the balance also bumps the HWM if we are at a new
+        # peak; cheaper than a separate accounting pass and keeps the
+        # value honest for any external reader.
+        if self.balance > self._high_water_mark:
+            self._high_water_mark = self.balance
         return self.balance
-    
+
     def get_positions(self) -> Dict:
         return self.positions
-    
+
     def calculate_pnl(self) -> float:
-        """Calculate total profit/loss"""
+        """Calculate total unrealised profit/loss across open positions."""
         total_pnl = 0.0
         for position in self.positions.values():
             total_pnl += position.get('pnl', 0.0)
         return total_pnl
-    
-    def add_trade(self, trade: Dict):
+
+    def daily_pnl(self, *, today: Optional[date] = None) -> float:
+        """Realised PnL accumulated for the current trading day.
+
+        `today` is injectable for tests. Defaults to UTC today. The
+        counter resets automatically the moment a different date is
+        observed, so callers do not have to remember to roll it over.
+        """
+        today = today or datetime.now(tz=timezone.utc).date()
+        if self._daily_pnl_day != today:
+            self._daily_pnl = 0.0
+            self._daily_pnl_day = today
+        return self._daily_pnl
+
+    def high_water_mark(self) -> float:
+        # Refresh in case balance grew without a trade being recorded
+        # through add_trade (e.g. mark-to-market updates).
+        if self.balance > self._high_water_mark:
+            self._high_water_mark = self.balance
+        return self._high_water_mark
+
+    def add_trade(self, trade: Dict, *, today: Optional[date] = None) -> None:
         self.trades.append(trade)
-        # Update balance based on trade result
-        if 'pnl' in trade:
-            self.balance += trade['pnl']
+        pnl = trade.get('pnl', 0.0)
+        if pnl:
+            self.balance += pnl
+            # Keep daily_pnl current with the same day-rollover logic.
+            today = today or datetime.now(tz=timezone.utc).date()
+            if self._daily_pnl_day != today:
+                self._daily_pnl = 0.0
+                self._daily_pnl_day = today
+            self._daily_pnl += pnl
+        if self.balance > self._high_water_mark:
+            self._high_water_mark = self.balance
 
 
 class TradingEngine:
