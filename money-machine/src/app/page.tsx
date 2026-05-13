@@ -71,7 +71,7 @@ export default function Dashboard() {
         transition={{ delay: 0.5 }}
         className="mt-12 text-center text-sm text-[var(--text-muted)]"
       >
-        Money Machine v0.1.0 • Powered by Claude AI
+        Money Machine v0.1.0 • Part of the AlphaAxiom Ecosystem
       </motion.footer>
     </div>
   );
