@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
@@ -70,20 +71,37 @@ class PaperAdapter(ExecutionAdapter):
         self._open_orders: Dict[str, OrderRequest] = {}
         self.commission = commission or FlatCommission(rate=0.0)
         self.slippage = slippage or FixedSlippage(bps=0.0)
-        # All mutations go through `_lock` so concurrent place/cancel
-        # calls cannot tear position bookkeeping.
+        # Two locks, one per concurrency model:
+        # - `_lock` (asyncio): protects the async `place_order` /
+        #   `cancel_order` / `process_open_orders` paths against
+        #   coroutine interleaving.
+        # - `_sync_lock` (threading): protects the sync paths
+        #   `place_order_sync` and `reset` against thread-vs-thread
+        #   races. Used by short-lived hosts (RL env step, vectorised
+        #   backtests) that must not pay the asyncio.run overhead
+        #   per call.
+        # Mixing async and sync entry points on the SAME adapter
+        # instance is not supported; the two locks do not coordinate
+        # with each other. Pick one concurrency model per adapter.
         self._lock = asyncio.Lock()
+        self._sync_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Test/dev helpers
     # ------------------------------------------------------------------
 
     def set_mark_price(self, symbol: str, price: float) -> None:
-        """Update the mark used for fills on `symbol`.
-
-        Rejects non-finite values (NaN/inf) explicitly: those would
-        propagate straight into quantity/notional math on the next
-        fill and silently corrupt balance and positions.
+        """
+        Update the mark price used for fills for the given symbol.
+        
+        Converts `price` to float and validates it is finite and greater than zero before storing it.
+        
+        Parameters:
+            symbol (str): Symbol whose mark price will be set.
+            price (float): New mark price (will be converted to float).
+        
+        Raises:
+            AdapterError: If `price` is not convertible to float, is not finite, or is not greater than zero.
         """
         try:
             value = float(price)
@@ -97,12 +115,123 @@ class PaperAdapter(ExecutionAdapter):
             )
         self._mark_prices[symbol] = value
 
-    async def process_open_orders(self) -> List[OrderResult]:
-        """Re-evaluate every PENDING limit order against current marks.
+    def reset(self, *, initial_balance: Optional[float] = None) -> None:
+        """Wipe order history, positions, and balance back to a
+        clean state. Mark prices and the configured cost models
+        are preserved.
 
-        Returns the orders that newly filled. Pending orders that
-        still cannot fill are left in place. Call this after each
-        `set_mark_price` if you want LIMIT orders to clear.
+        Used by short-lived simulations (RL training, walk-forward
+        sweeps) that need a fresh adapter at the top of every
+        episode without paying the cost of re-instantiation. The
+        public method replaces the previous pattern of poking at
+        the underscore-prefixed attributes from outside, which
+        broke encapsulation and made the adapter fragile to
+        bookkeeping changes.
+
+        Thread safety: serialised against other sync callers via
+        `_sync_lock`. NOT coordinated with the async `_lock`; do
+        not call `reset()` while async `place_order` /
+        `cancel_order` / `process_open_orders` calls are in
+        flight on the same adapter instance.
+
+        Args:
+            initial_balance: Optional new starting cash balance
+                (must be >= 0). When None, the existing balance is
+                preserved while positions and history are cleared.
+
+        Raises:
+            AdapterError: If `initial_balance` is provided and
+                negative.
+        """
+        if initial_balance is not None:
+            try:
+                candidate = float(initial_balance)
+            except (TypeError, ValueError) as exc:
+                raise AdapterError(
+                    f"initial_balance must be numeric, got {initial_balance!r}"
+                ) from exc
+            import math
+
+            if not math.isfinite(candidate) or candidate < 0:
+                raise AdapterError(
+                    "initial_balance must be a finite non-negative "
+                    f"number, got {initial_balance!r}"
+                )
+        with self._sync_lock:
+            if initial_balance is not None:
+                self._balance = float(initial_balance)
+            self._positions.clear()
+            self._order_history.clear()
+            self._open_orders.clear()
+
+    def place_order_sync(self, request: OrderRequest) -> OrderResult:
+        """Synchronous market-order entry point for non-async hosts.
+
+        Provides the same fill logic as `place_order` without the
+        asyncio overhead. Designed for tight loops (RL env step,
+        vectorised backtests) that would otherwise spin up a fresh
+        event loop on every call via `asyncio.run`.
+
+        Thread safety: serialised against other sync callers via
+        `_sync_lock`, so two threads invoking this method on the
+        same adapter cannot tear balance / position state. The
+        `_locked`-suffixed helpers below assume the caller holds
+        SOME serialising mechanism; `_sync_lock` plays that role
+        for this entry point, mirroring what `_lock` does for the
+        async `place_order` path.
+
+        NOT coordinated with the async `_lock`. Do not invoke
+        `place_order_sync` and the async `place_order` /
+        `cancel_order` / `process_open_orders` concurrently on the
+        same adapter instance; pick one concurrency model per
+        adapter.
+
+        Limitations: LIMIT orders that would park as PENDING are
+        rejected here (PENDING management requires the async path
+        and `process_open_orders` to clear).
+        """
+        with self._sync_lock:
+            cached = self._order_history.get(request.client_order_id)
+            if cached is not None:
+                return cached
+
+            error = self._validate_request(request)
+            if error is not None:
+                result = self._reject(request, error)
+                self._order_history[request.client_order_id] = result
+                return result
+
+            mark = self._mark_prices.get(request.symbol)
+            if mark is None:
+                result = self._reject(
+                    request, f"no mark price set for {request.symbol}"
+                )
+                self._order_history[request.client_order_id] = result
+                return result
+
+            if request.order_type is OrderType.MARKET:
+                result = self._fill_market_locked(request, mark)
+            else:
+                if self._limit_can_fill(request, mark):
+                    result = self._fill_limit_locked(request, mark)
+                else:
+                    result = self._reject(
+                        request,
+                        "place_order_sync rejects unfillable LIMIT orders; "
+                        "use the async place_order path for PENDING management",
+                    )
+
+            self._order_history[request.client_order_id] = result
+            return result
+
+    async def process_open_orders(self) -> List[OrderResult]:
+        """
+        Re-evaluate all pending LIMIT orders against current mark prices and return those that were filled.
+        
+        Pending LIMIT orders whose conditions are still not met remain open; orders without a known mark price are skipped.
+        
+        Returns:
+            newly_filled (List[OrderResult]): List of OrderResult objects for orders that were filled during this call.
         """
         newly_filled: List[OrderResult] = []
         async with self._lock:

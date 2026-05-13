@@ -593,3 +593,300 @@ def test_limit_sell_fill_clamped_to_limit_price_after_slippage() -> None:
         assert result.average_fill_price == pytest.approx(100.0)
 
     _run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# PaperAdapter.reset() — new method added in this PR
+# ---------------------------------------------------------------------------
+
+
+def test_reset_without_balance_arg_preserves_balance() -> None:
+    """reset() without `initial_balance` must clear positions and orders
+    but leave the balance at whatever it was before the call.
+    """
+    async def scenario() -> None:
+        adapter = PaperAdapter(initial_balance=10_000.0)
+        adapter.set_mark_price("BTC/USDT", 50_000.0)
+        await adapter.place_order(_market_buy("o1", notional=3_000.0))
+        balance_after_buy = await adapter.get_balance()
+        assert balance_after_buy < 10_000.0
+
+        adapter.reset()  # no initial_balance kwarg
+
+        # Balance unchanged, positions and order history cleared.
+        assert (await adapter.get_balance()) == pytest.approx(balance_after_buy)
+        assert (await adapter.get_positions()) == {}
+        assert (await adapter.get_open_orders()) == []
+
+    _run(scenario())
+
+
+def test_reset_with_zero_initial_balance_is_valid() -> None:
+    """Zero is a valid initial_balance; the adapter should start
+    with an empty account and reject any BUY order immediately.
+    """
+    adapter = PaperAdapter(initial_balance=10_000.0)
+    adapter.reset(initial_balance=0.0)
+    assert adapter._balance == pytest.approx(0.0)  # type: ignore[attr-defined]
+
+
+def test_reset_with_negative_initial_balance_raises() -> None:
+    """A negative initial_balance must raise AdapterError — the same
+    guard that the constructor applies.
+    """
+    adapter = PaperAdapter(initial_balance=10_000.0)
+    with pytest.raises(AdapterError):
+        adapter.reset(initial_balance=-1.0)
+
+
+def test_reset_preserves_mark_prices_and_cost_models() -> None:
+    """Mark prices and the injected commission/slippage models must
+    survive reset() so the adapter is immediately usable without
+    reconfiguring the mark oracle.
+    """
+    adapter = PaperAdapter(
+        initial_balance=5_000.0,
+        commission=FlatCommission(rate=0.001),
+        slippage=FixedSlippage(bps=10.0),
+    )
+    adapter.set_mark_price("BTC/USDT", 50_000.0)
+    adapter.set_mark_price("ETH/USDT", 3_000.0)
+
+    adapter.reset(initial_balance=10_000.0)
+
+    # Both marks still accessible after reset.
+    assert adapter._mark_prices.get("BTC/USDT") == pytest.approx(50_000.0)  # type: ignore[attr-defined]
+    assert adapter._mark_prices.get("ETH/USDT") == pytest.approx(3_000.0)  # type: ignore[attr-defined]
+    # Cost models preserved too.
+    assert adapter.commission is not None
+    assert adapter.slippage is not None
+
+
+def test_reset_clears_pending_limit_orders() -> None:
+    """Any pending (open) limit orders must be purged by reset().
+    The adapter must not process them after a reset; they belong
+    to the previous episode's context.
+    """
+    async def scenario() -> None:
+        adapter = PaperAdapter(initial_balance=10_000.0)
+        adapter.set_mark_price("BTC/USDT", 50_000.0)
+
+        # Park a limit order that cannot fill at current mark.
+        req = OrderRequest(
+            client_order_id="lim-ep1",
+            symbol="BTC/USDT",
+            side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            notional=1_000.0,
+            limit_price=40_000.0,  # below current mark -> PENDING
+        )
+        result = await adapter.place_order(req)
+        assert result.status is OrderStatus.PENDING
+        assert len(await adapter.get_open_orders()) == 1
+
+        adapter.reset(initial_balance=10_000.0)
+
+        # Open orders list must be empty after reset.
+        assert (await adapter.get_open_orders()) == []
+
+    _run(scenario())
+
+
+def test_reset_clears_order_history_so_id_can_be_reused() -> None:
+    """After reset(), a previously-used client_order_id must no
+    longer be in the history. The idempotency cache is episode-
+    scoped; old ids must not bleed into the next episode.
+
+    Passing `initial_balance` to reset() restarts equity from
+    that value, so each post-reset BUY costs against the fresh
+    balance, not the carry-over from the first fill.
+    """
+    async def scenario() -> None:
+        adapter = PaperAdapter(initial_balance=10_000.0)
+        adapter.set_mark_price("BTC/USDT", 50_000.0)
+
+        first = await adapter.place_order(_market_buy("reused-id", notional=1_000.0))
+        assert first.status is OrderStatus.FILLED
+
+        adapter.reset(initial_balance=10_000.0)
+
+        # Re-submit the same id; it must fill again (history is clear).
+        second = await adapter.place_order(_market_buy("reused-id", notional=1_000.0))
+        assert second.status is OrderStatus.FILLED
+        # Balance after reset = 10_000; one fill of 1_000 = 9_000.
+        balance = await adapter.get_balance()
+        assert balance == pytest.approx(9_000.0)
+
+    _run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# PaperAdapter.place_order_sync() — new method added in this PR
+# ---------------------------------------------------------------------------
+
+
+def test_place_order_sync_market_buy_fills_and_updates_balance() -> None:
+    """Basic synchronous BUY: balance decremented, position updated."""
+    adapter = PaperAdapter(initial_balance=10_000.0)
+    adapter.set_mark_price("BTC/USDT", 50_000.0)
+
+    result = adapter.place_order_sync(_market_buy("s1", notional=5_000.0))
+
+    assert result.status is OrderStatus.FILLED
+    assert result.filled_quantity == pytest.approx(0.1)
+    assert result.average_fill_price == pytest.approx(50_000.0)
+    # Balance debited synchronously.
+    assert adapter._balance == pytest.approx(5_000.0)  # type: ignore[attr-defined]
+    assert adapter._positions.get("BTC/USDT") == pytest.approx(0.1)  # type: ignore[attr-defined]
+
+
+def test_place_order_sync_market_sell_fills_and_credits_balance() -> None:
+    """SELL fills synchronously and credits the balance."""
+    adapter = PaperAdapter(initial_balance=10_000.0)
+    adapter.set_mark_price("BTC/USDT", 50_000.0)
+    # Seed a long position directly.
+    adapter._positions["BTC/USDT"] = 0.2  # type: ignore[attr-defined]
+
+    result = adapter.place_order_sync(_market_sell("s2", quantity=0.1))
+
+    assert result.status is OrderStatus.FILLED
+    # Cash credited by 0.1 * 50000 = 5000.
+    assert adapter._balance == pytest.approx(15_000.0)  # type: ignore[attr-defined]
+    assert adapter._positions.get("BTC/USDT") == pytest.approx(0.1)  # type: ignore[attr-defined]
+
+
+def test_place_order_sync_is_idempotent_on_client_order_id() -> None:
+    """Submitting the same client_order_id twice must return the
+    cached result without re-filling or double-debiting.
+    """
+    adapter = PaperAdapter(initial_balance=10_000.0)
+    adapter.set_mark_price("BTC/USDT", 50_000.0)
+
+    first = adapter.place_order_sync(_market_buy("idem-sync", notional=1_000.0))
+    second = adapter.place_order_sync(_market_buy("idem-sync", notional=1_000.0))
+
+    assert first.status is OrderStatus.FILLED
+    assert second.status is OrderStatus.FILLED
+    # Same result object (or at least same content).
+    assert first.client_order_id == second.client_order_id
+    # Balance debited only once.
+    assert adapter._balance == pytest.approx(9_000.0)  # type: ignore[attr-defined]
+
+
+def test_place_order_sync_rejects_when_no_mark_price() -> None:
+    """Without a mark price the sync path must reject gracefully."""
+    adapter = PaperAdapter(initial_balance=10_000.0)
+    # Deliberately do NOT call set_mark_price.
+
+    result = adapter.place_order_sync(_market_buy("no-mark", notional=1_000.0))
+
+    assert result.status is OrderStatus.REJECTED
+    assert "mark price" in (result.error or "")
+    assert adapter._balance == pytest.approx(10_000.0)  # type: ignore[attr-defined]
+
+
+def test_place_order_sync_rejects_invalid_request() -> None:
+    """An order with no sizing (neither quantity nor notional) must
+    be rejected and stored in order history.
+    """
+    adapter = PaperAdapter(initial_balance=10_000.0)
+    adapter.set_mark_price("BTC/USDT", 50_000.0)
+
+    bad = OrderRequest(
+        client_order_id="bad-sync",
+        symbol="BTC/USDT",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        notional=None,
+        quantity=None,
+    )
+    result = adapter.place_order_sync(bad)
+
+    assert result.status is OrderStatus.REJECTED
+    assert adapter._balance == pytest.approx(10_000.0)  # type: ignore[attr-defined]
+
+
+def test_place_order_sync_rejects_insufficient_balance() -> None:
+    """A BUY whose notional exceeds the available balance must be
+    rejected without mutating balance or positions.
+    """
+    adapter = PaperAdapter(initial_balance=100.0)
+    adapter.set_mark_price("BTC/USDT", 50_000.0)
+
+    result = adapter.place_order_sync(_market_buy("oversize-sync", notional=10_000.0))
+
+    assert result.status is OrderStatus.REJECTED
+    assert "insufficient balance" in (result.error or "")
+    assert adapter._balance == pytest.approx(100.0)  # type: ignore[attr-defined]
+    assert adapter._positions == {}  # type: ignore[attr-defined]
+
+
+def test_place_order_sync_fills_fillable_limit_order() -> None:
+    """A LIMIT BUY whose limit_price >= mark should fill immediately
+    via the sync path (it does not need to park PENDING).
+    """
+    adapter = PaperAdapter(
+        initial_balance=10_000.0,
+        commission=FlatCommission(rate=0.0),
+        slippage=FixedSlippage(bps=0.0),
+    )
+    adapter.set_mark_price("BTC/USDT", 100.0)
+
+    # BUY limit at 110 with mark at 100: mark <= limit -> can fill.
+    req = OrderRequest(
+        client_order_id="lim-sync-fill",
+        symbol="BTC/USDT",
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        quantity=1.0,
+        limit_price=110.0,
+    )
+    result = adapter.place_order_sync(req)
+
+    assert result.status is OrderStatus.FILLED
+    # Fills at min(limit, mark) = 100.
+    assert result.average_fill_price == pytest.approx(100.0)
+
+
+def test_place_order_sync_rejects_unfillable_limit_order() -> None:
+    """An unfillable LIMIT order must be REJECTED (not PENDING),
+    since the sync path cannot manage PENDING state. The caller
+    must use the async place_order path for PENDING management.
+    """
+    adapter = PaperAdapter(initial_balance=10_000.0)
+    adapter.set_mark_price("BTC/USDT", 50_000.0)
+
+    # BUY limit at 40000 with mark at 50000: mark > limit -> unfillable.
+    req = OrderRequest(
+        client_order_id="lim-sync-nofill",
+        symbol="BTC/USDT",
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        notional=1_000.0,
+        limit_price=40_000.0,
+    )
+    result = adapter.place_order_sync(req)
+
+    assert result.status is OrderStatus.REJECTED
+    assert "place_order_sync" in (result.error or "") or "async" in (result.error or "")
+    # Balance unchanged.
+    assert adapter._balance == pytest.approx(10_000.0)  # type: ignore[attr-defined]
+    # Must NOT appear in open orders (which is async-only).
+    assert adapter._open_orders == {}  # type: ignore[attr-defined]
+
+
+def test_place_order_sync_works_inside_running_event_loop() -> None:
+    """place_order_sync must not call asyncio.run internally; it
+    must be callable from within an already-running event loop
+    without raising RuntimeError.
+    """
+    import asyncio
+
+    adapter = PaperAdapter(initial_balance=10_000.0)
+    adapter.set_mark_price("BTC/USDT", 50_000.0)
+
+    async def drive() -> OrderResult:
+        return adapter.place_order_sync(_market_buy("loop-sync", notional=1_000.0))
+
+    result = asyncio.run(drive())
+    assert result.status is OrderStatus.FILLED
