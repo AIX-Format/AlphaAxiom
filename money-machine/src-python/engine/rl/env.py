@@ -239,6 +239,28 @@ class TradingEnv(gym.Env):
                 "EnvConfig.seed must be None or a non-negative int, "
                 f"got {self.config.seed!r}"
             )
+        # `allow_short` is consulted as a truthy boolean
+        # (`if not self.config.allow_short`). When a config comes
+        # from YAML / JSON the value can land as a truthy string
+        # like 'false' or an int (1/0), and the long-only safety
+        # constraint silently flips. Require an actual bool.
+        if not isinstance(self.config.allow_short, bool):
+            raise ValueError(
+                "EnvConfig.allow_short must be a bool, got "
+                f"{self.config.allow_short!r}"
+            )
+        # `symbol` flows into every OrderRequest. A non-string or
+        # empty/whitespace value would be rejected by the adapter
+        # on every tick, silently turning the env into a HOLD-only
+        # loop and wasting full training runs. Catch it here.
+        if (
+            not isinstance(self.config.symbol, str)
+            or not self.config.symbol.strip()
+        ):
+            raise ValueError(
+                "EnvConfig.symbol must be a non-empty string, got "
+                f"{self.config.symbol!r}"
+            )
 
         # Precompute the static indicator series once. Indexing
         # them during step keeps each tick O(1) instead of
@@ -368,6 +390,15 @@ class TradingEnv(gym.Env):
             - truncated (bool): `True` if the episode ended due to reaching the final bar.
             - info (dict): diagnostic information including keys: `step`, `equity`, `position`, `bar_index`, `prev_peak_equity`, `new_peak_equity`, `step_return`, and `fill` (order/fill summary).
         """
+        # Explicit bool reject: `bool` is a subclass of `int` in
+        # Python, so `action_space.contains(True)` returns True
+        # (True -> 1 -> BUY). A wiring bug that emits booleans
+        # from the policy would silently execute trades; reject
+        # before the space-membership check.
+        if isinstance(action, bool):
+            raise ValueError(
+                f"action must be a member of {self.action_space!r}, got {action!r}"
+            )
         if not self.action_space.contains(action):
             raise ValueError(
                 f"action must be a member of {self.action_space!r}, got {action!r}"

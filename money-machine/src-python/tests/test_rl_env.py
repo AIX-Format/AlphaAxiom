@@ -404,6 +404,59 @@ def test_env_rejects_invalid_position_fraction() -> None:
             )
 
 
+def test_env_rejects_boolean_action() -> None:
+    """bool is a subclass of int in Python, so
+    `action_space.contains(True)` returns True and True silently
+    maps to BUY. A wiring bug that emits booleans from the policy
+    must fail fast, not execute a hidden BUY/HOLD.
+    """
+    env = _build_env(closes=[100.0 + i for i in range(40)])
+    env.reset()
+    with pytest.raises(ValueError, match="action"):
+        env.step(True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="action"):
+        env.step(False)  # type: ignore[arg-type]
+
+
+def test_env_rejects_non_bool_allow_short() -> None:
+    """allow_short is consulted as truthy. From a YAML/JSON config
+    the value could land as a string 'false' (truthy in Python)
+    or an int. Either silently flips the long-only safety
+    constraint; require a real bool."""
+    df = _build_df([100.0 + i * 0.1 for i in range(40)])
+    adapter = PaperAdapter(initial_balance=10_000.0)
+    for bad in ("false", "true", 0, 1, None):
+        with pytest.raises(ValueError, match="allow_short"):
+            TradingEnv(
+                df,
+                adapter,
+                EnvConfig(
+                    allow_short=bad,  # type: ignore[arg-type]
+                    warmup_bars=20,
+                    observation=ObservationConfig(window_size=8),
+                ),
+            )
+
+
+def test_env_rejects_invalid_symbol() -> None:
+    """A non-string, empty, or whitespace symbol would be rejected
+    by the adapter on every BUY/SELL, silently HOLD-ing the env
+    for the entire run."""
+    df = _build_df([100.0 + i * 0.1 for i in range(40)])
+    adapter = PaperAdapter(initial_balance=10_000.0)
+    for bad in ("", "   ", None, 42, ["BTC/USDT"]):
+        with pytest.raises(ValueError, match="symbol"):
+            TradingEnv(
+                df,
+                adapter,
+                EnvConfig(
+                    symbol=bad,  # type: ignore[arg-type]
+                    warmup_bars=20,
+                    observation=ObservationConfig(window_size=8),
+                ),
+            )
+
+
 def test_env_rejects_invalid_seed() -> None:
     """EnvConfig.seed flows straight into Gymnasium's
     `super().reset(seed=...)` which requires a non-negative int
