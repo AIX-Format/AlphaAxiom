@@ -99,10 +99,11 @@ class MarketDataService:
                 f"unknown interval {interval!r}. Known: {sorted(INTERVAL_MS)}"
             )
 
-        key = (
-            symbol.replace("/", "").replace(":", "_").upper(),
-            interval,
-        )
+        # Lock key must be derived the same way as the cache path
+        # so two callers for the same (symbol, interval) serialise
+        # through the same lock - and two callers for DIFFERENT
+        # symbols that happen to share characters do NOT collide.
+        key = (str(self._cache_path(symbol, interval)), interval)
         lock = self._cache_locks.setdefault(key, asyncio.Lock())
         async with lock:
             cached = self._load_cache(symbol, interval)
@@ -133,7 +134,30 @@ class MarketDataService:
     # ------------------------------------------------------------------
 
     def _cache_path(self, symbol: str, interval: str) -> Path:
-        safe = symbol.replace("/", "").replace(":", "_").upper()
+        # Preserve symbol structure so distinct markets cannot
+        # collide on the cache filename. The previous version
+        # mapped both `AB/CD` and `A/BCD` to `ABCD_1h.csv`,
+        # silently serving candles for the wrong instrument once
+        # either one warmed the cache.
+        #
+        # Replacement rules:
+        #   '/'  -> '__'   (visual separator that cannot appear in
+        #                   the original alphanumeric venue symbol)
+        #   ':'  -> '_'    (kept consistent with the prior layout)
+        # Anything else outside [A-Z0-9_.-] is hex-escaped so
+        # exotic suffixes survive a round-trip without colliding.
+        upper = symbol.upper()
+        out_chars: List[str] = []
+        for ch in upper:
+            if ch == "/":
+                out_chars.append("__")
+            elif ch == ":":
+                out_chars.append("_")
+            elif ch.isalnum() or ch in {"_", ".", "-"}:
+                out_chars.append(ch)
+            else:
+                out_chars.append(f"%{ord(ch):02X}")
+        safe = "".join(out_chars)
         return self.cache_dir / f"{safe}_{interval}.csv"
 
     def _load_cache(self, symbol: str, interval: str) -> pd.DataFrame:

@@ -476,6 +476,45 @@ def test_binance_client_strips_colon_contract_suffix() -> None:
     _run(scenario())
 
 
+def test_cache_path_does_not_collide_for_distinct_symbols(tmp_path: Path) -> None:
+    """The old `replace('/', '')` rule mapped AB/CD and A/BCD to
+    the same filename, so once one warmed the cache the other
+    would silently read someone else's candles. The new escape
+    preserves the slash position so distinct markets stay
+    distinct.
+    """
+    async def scenario() -> None:
+        # Two stub clients with different candle universes.
+        client_abcd = _StubClient(_candles(0, 5))
+        client_a_bcd = _StubClient(
+            [
+                Candle(
+                    open_time_ms=i * HOUR_MS,
+                    open=500.0 + i,
+                    high=501.0 + i,
+                    low=499.0 + i,
+                    close=500.5 + i,
+                    volume=10.0,
+                )
+                for i in range(5)
+            ]
+        )
+        # Both services point at the same cache dir.
+        svc_abcd = MarketDataService(client=client_abcd, cache_dir=tmp_path)
+        svc_a_bcd = MarketDataService(client=client_a_bcd, cache_dir=tmp_path)
+
+        a = await svc_abcd.get_ohlcv("AB/CD", "1h", 0, 5 * HOUR_MS)
+        b = await svc_a_bcd.get_ohlcv("A/BCD", "1h", 0, 5 * HOUR_MS)
+        # The two services produced different bars because they
+        # wrote to different cache files.
+        assert a.iloc[0]["close"] != b.iloc[0]["close"]
+        # Confirm two distinct files were created.
+        files = sorted(p.name for p in tmp_path.glob("*.csv"))
+        assert len(files) == 2
+
+    _run(scenario())
+
+
 def test_missing_ranges_detects_internal_hole(tmp_path: Path) -> None:
     """A cache with an internal hole (e.g. one row was dropped by
     _load_cache's malformed-row filter) must trigger a refetch of
