@@ -121,8 +121,40 @@ class SignalPipeline:
     # ------------------------------------------------------------------
 
     async def run_once(self, df: pd.DataFrame) -> PipelineResult:
-        """Run one pass: generate, size, risk-check, optionally execute."""
-        signal = self.strategy.generate_signal(df)
+        """Run one pass: generate, size, risk-check, optionally execute.
+
+        The pipeline never raises. Any escape from the strategy's
+        generate_signal (a transient bug, malformed input, a buggy
+        third-party indicator) is converted into a synthetic HOLD
+        PipelineResult so the caller still gets a record of the tick
+        and downstream telemetry (audit log, dashboards) sees the
+        failure instead of an opaque crash.
+        """
+        try:
+            signal = self.strategy.generate_signal(df)
+        except Exception as exc:
+            logger.error(
+                "Strategy %s raised on generate_signal: %s",
+                getattr(self.strategy, "name", type(self.strategy).__name__),
+                exc,
+            )
+            symbol = getattr(self.strategy, "symbol", "")
+            fallback = TradingSignal(
+                symbol=symbol,
+                action="HOLD",
+                confidence=0.0,
+                strategy=getattr(self.strategy, "name", ""),
+                reasoning=f"strategy raised: {exc}",
+            )
+            return PipelineResult(
+                signal=fallback,
+                risk_decision=RiskDecision(
+                    approved=False,
+                    reason=RejectionReason.NON_ACTIONABLE_SIGNAL,
+                    detail=f"strategy exception: {exc}",
+                ),
+                position_size=0.0,
+            )
 
         # Skip every downstream step for HOLD / zero-confidence: the
         # risk shield would also reject them, but doing it here keeps

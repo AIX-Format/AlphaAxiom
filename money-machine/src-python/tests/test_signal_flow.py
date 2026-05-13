@@ -191,6 +191,47 @@ def test_executed_signal_passed_risk_and_has_nonzero_size() -> None:
 # ---------------------------------------------------------------------------
 
 
+class _RaisingStrategy(Strategy):
+    """Strategy that raises on every call. Used to verify the
+    pipeline catches and converts the failure into a HOLD result.
+    """
+
+    name = "raising-strategy"
+
+    def generate_signal(self, df: pd.DataFrame) -> TradingSignal:
+        raise RuntimeError("boom")
+
+
+def test_strategy_exception_is_caught_and_returns_synthetic_hold() -> None:
+    """The pipeline contract is 'never raises'. A bug in the strategy
+    must surface as a HOLD PipelineResult with a reason string, not
+    as an exception that crashes the orchestrator and skips every
+    downstream piece (risk shield, telemetry, dashboard updates).
+    """
+    portfolio = Portfolio(initial_balance=10_000.0)
+    engine = StubEngine(portfolio=portfolio)
+    shield = RiskShield(clock=_frozen_clock(T0))
+    pipeline = SignalPipeline(
+        _RaisingStrategy("BTC/USDT"),
+        shield,
+        engine,
+    )
+
+    result = _run(pipeline.run_once(pd.DataFrame()))
+
+    assert isinstance(result, PipelineResult)
+    assert result.executed is False
+    assert result.position_size == 0.0
+    assert result.signal.action == "HOLD"
+    assert "boom" in result.signal.reasoning
+    assert result.risk_decision.reason == RejectionReason.NON_ACTIONABLE_SIGNAL
+    assert "boom" in (result.risk_decision.detail or "")
+    # The shield was never consulted (it would have approved/rejected
+    # via its own audit log); strategy exceptions short-circuit there.
+    assert shield.audit_log() == []
+    assert engine.received == []
+
+
 def test_hold_signal_short_circuits_without_execution() -> None:
     portfolio = Portfolio(initial_balance=10_000.0)
     engine = StubEngine(portfolio=portfolio)
