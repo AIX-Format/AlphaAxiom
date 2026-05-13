@@ -156,6 +156,11 @@ class Keystore:
 
         if not isinstance(private_key, (bytes, bytearray)) or not private_key:
             raise KeystoreError("private_key must be non-empty bytes")
+        # Normalise to immutable bytes so the later
+        # _frame_plaintext call (which does b"" + private_key)
+        # works for both bytes and bytearray inputs without
+        # raising TypeError.
+        private_key = bytes(private_key)
         if not password:
             raise KeystoreError("password must be non-empty")
         if not chain:
@@ -298,12 +303,19 @@ class Keystore:
     # ------------------------------------------------------------------
 
     def _path_for(self, entry_id: str) -> Path:
-        safe = "".join(
-            c for c in entry_id if c.isalnum() or c in {"-", "_"}
-        )
-        if not safe:
+        # Reject any disallowed character outright instead of
+        # silently stripping it. Otherwise two distinct ids ("ab/c"
+        # and "abc") could collapse to the same filename and
+        # store_key would silently overwrite the wrong entry.
+        if not isinstance(entry_id, str) or not entry_id:
             raise KeystoreError(f"invalid entry_id {entry_id!r}")
-        return self.directory / f"{safe}.json"
+        for ch in entry_id:
+            if not (ch.isalnum() or ch in {"-", "_"}):
+                raise KeystoreError(
+                    f"invalid entry_id {entry_id!r}: contains {ch!r}; "
+                    f"only alphanumerics, '-' and '_' are allowed"
+                )
+        return self.directory / f"{entry_id}.json"
 
     def _read_envelope(self, entry_id: str) -> Dict[str, Any]:
         path = self._path_for(entry_id)

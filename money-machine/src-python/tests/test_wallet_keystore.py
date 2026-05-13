@@ -72,6 +72,23 @@ def test_round_trip_with_solana_64_byte_key(tmp_path: Path) -> None:
     assert recovered == PRIVATE_KEY_64
 
 
+def test_round_trip_for_bytearray_private_key(tmp_path: Path) -> None:
+    """`store_key` accepts both `bytes` and `bytearray`. A
+    `bytearray` input previously crashed inside `_frame_plaintext`
+    because of the `bytes + bytearray` concatenation; the
+    normalisation step prevents that.
+    """
+    ks = Keystore(tmp_path)
+    ba = bytearray(PRIVATE_KEY_32)
+    entry = ks.store_key(
+        private_key=ba,
+        password="pw",
+        label="bytearray-test",
+        chain="ethereum",
+    )
+    assert ks.load_key(entry.id, "pw") == PRIVATE_KEY_32
+
+
 def test_round_trip_for_unicode_password(tmp_path: Path) -> None:
     ks = Keystore(tmp_path)
     pwd = "كلمة-سر-قوية-😀"
@@ -283,6 +300,28 @@ def test_store_rejects_empty_inputs(tmp_path: Path, kwargs) -> None:
     base.update(kwargs)
     with pytest.raises(KeystoreError):
         ks.store_key(**base)
+
+
+def test_store_rejects_entry_id_with_disallowed_chars(tmp_path: Path) -> None:
+    """A slash (or other punctuation) in entry_id used to be
+    silently stripped; that let two distinct IDs collapse to the
+    same filename and store_key could overwrite a different entry.
+    We now reject any disallowed character outright.
+    """
+    ks = Keystore(tmp_path)
+    for bad_id in ("ab/c", "..", "foo bar", "id;rm -rf"):
+        with pytest.raises(KeystoreError):
+            ks.store_key(
+                private_key=PRIVATE_KEY_32,
+                password="pw",
+                label="t",
+                chain="ethereum",
+                entry_id=bad_id,
+            )
+    # And load_key cannot reach the filesystem with such an id
+    # either.
+    with pytest.raises(KeystoreError):
+        ks.load_key("ab/c", "pw")
 
 
 def test_load_unknown_entry_raises_keystore_error(tmp_path: Path) -> None:
