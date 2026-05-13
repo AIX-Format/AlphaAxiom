@@ -138,10 +138,16 @@ class DrawdownPenaltyReward:
 
 @dataclass
 class TurnoverPenaltyReward:
-    """Charge a flat penalty whenever the agent flips direction.
+    """Charge a flat penalty when the agent flips direction.
+
+    "Flip" means crossing zero: long -> short or short -> long.
+    Opening from flat (0 -> long), scaling in or out, and closing
+    to flat (long -> 0) all return 0; charging those would
+    discourage normal position management instead of curbing the
+    long/short churn we actually care about.
 
     Useful when commissions are small enough that PnL alone does
-    not teach the agent to stay in the trade.
+    not teach the agent to stay in a trade.
     """
 
     penalty: float = 0.001
@@ -155,10 +161,10 @@ class TurnoverPenaltyReward:
         new_position: float,
         info: dict,
     ) -> float:
-        if prev_position == new_position:
+        # A direction flip requires both sides to be non-zero with
+        # opposite signs. `prev * new < 0` captures exactly that.
+        if prev_position * new_position >= 0:
             return 0.0
-        # Charge once for a flip; same magnitude regardless of size
-        # so the agent learns "don't flip unless the move is real".
         return _safe_float(-self.penalty)
 
 
@@ -255,12 +261,19 @@ def composite(*parts: RewardFunction) -> RewardFunction:
     ) -> float:
         total = 0.0
         for fn in parts_tuple:
-            total += fn(
-                prev_equity=prev_equity,
-                new_equity=new_equity,
-                prev_position=prev_position,
-                new_position=new_position,
-                info=info,
+            # Coerce each component to a finite value before
+            # accumulating; otherwise one NaN/inf would taint the
+            # running sum and `_safe_float(total)` would collapse
+            # the WHOLE composite to 0, discarding the other
+            # components that returned valid values.
+            total += _safe_float(
+                fn(
+                    prev_equity=prev_equity,
+                    new_equity=new_equity,
+                    prev_position=prev_position,
+                    new_position=new_position,
+                    info=info,
+                )
             )
         return _safe_float(total)
 

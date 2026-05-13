@@ -184,7 +184,13 @@ class TradingEnv(gym.Env):
         seed: Optional[int] = None,
         options: Optional[Dict[str, Any]] = None,
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
-        super().reset(seed=seed)
+        # Honour `EnvConfig.seed` when the caller does not pass an
+        # explicit seed. Most RL training loops set the seed once
+        # at construction time via the config and then call
+        # `env.reset()` without arguments; without this fallback
+        # the config knob is silently ignored.
+        effective_seed = self.config.seed if seed is None else seed
+        super().reset(seed=effective_seed)
         self._current_bar = self.config.warmup_bars
         self._equity = self._initial_equity
         self._peak_equity = self._initial_equity
@@ -209,8 +215,13 @@ class TradingEnv(gym.Env):
     def step(
         self, action: int
     ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        if not 0 <= int(action) <= 2:
-            raise ValueError(f"action must be in {{0, 1, 2}}, got {action!r}")
+        # Use the Gymnasium space's own `contains` predicate so
+        # non-integer inputs (e.g. 1.9) are rejected instead of
+        # being silently coerced to a valid action via `int()`.
+        if not self.action_space.contains(action):
+            raise ValueError(
+                f"action must be a member of {self.action_space!r}, got {action!r}"
+            )
 
         prev_equity = self._equity
         prev_position = self._position
@@ -398,6 +409,24 @@ class TradingEnv(gym.Env):
                 self._position += qty
             else:
                 self._position -= qty
+                # Post-fill clamp: with slippage, a SELL whose
+                # notional was pre-capped to `position * mark` can
+                # still produce a quantity slightly larger than
+                # `self._position` (the fill price ends up below
+                # `mark`, so `qty = notional / fill_price >
+                # position`). Without this clamp, `allow_short=
+                # False` could be silently violated. We clip the
+                # position back to zero and surface the deviation
+                # in the fill info so reward functions can see it.
+                if not self.config.allow_short and self._position < 0:
+                    overshoot = -self._position
+                    self._position = 0.0
+                    return {
+                        "status": "FILLED",
+                        "fill_price": float(result.average_fill_price or mark),
+                        "quantity": qty,
+                        "short_overshoot_clamped": overshoot,
+                    }
             return {
                 "status": "FILLED",
                 "fill_price": float(result.average_fill_price or mark),

@@ -144,14 +144,30 @@ def test_drawdown_penalty_charges_new_drawdown_only() -> None:
     assert out == 0.0
 
 
-def test_turnover_penalty_charges_on_flip_only() -> None:
+def test_turnover_penalty_charges_direction_flip_only() -> None:
+    """Direction flip = sign change across zero. Opening from flat,
+    scaling in / out, and closing to flat are all unchanged."""
     r = TurnoverPenaltyReward(penalty=0.01)
-    # Same direction -> no penalty.
-    assert r(prev_equity=1.0, new_equity=1.0, prev_position=1.0, new_position=1.0, info={}) == 0.0
-    # Flip long -> short.
-    assert r(prev_equity=1.0, new_equity=1.0, prev_position=1.0, new_position=-1.0, info={}) == pytest.approx(-0.01)
-    # Open from flat.
-    assert r(prev_equity=1.0, new_equity=1.0, prev_position=0.0, new_position=1.0, info={}) == pytest.approx(-0.01)
+
+    # Same direction (long -> bigger long) -> no penalty.
+    assert r(prev_equity=1.0, new_equity=1.0,
+             prev_position=1.0, new_position=2.0, info={}) == 0.0
+    # Flat -> long: NOT a flip, no penalty. Encourages normal
+    # position management.
+    assert r(prev_equity=1.0, new_equity=1.0,
+             prev_position=0.0, new_position=1.0, info={}) == 0.0
+    # Long -> flat: NOT a flip, no penalty.
+    assert r(prev_equity=1.0, new_equity=1.0,
+             prev_position=1.0, new_position=0.0, info={}) == 0.0
+    # Flat -> short: NOT a flip, no penalty.
+    assert r(prev_equity=1.0, new_equity=1.0,
+             prev_position=0.0, new_position=-1.0, info={}) == 0.0
+    # Long -> short: REAL flip, charged.
+    assert r(prev_equity=1.0, new_equity=1.0,
+             prev_position=1.0, new_position=-1.0, info={}) == pytest.approx(-0.01)
+    # Short -> long: REAL flip, charged.
+    assert r(prev_equity=1.0, new_equity=1.0,
+             prev_position=-1.0, new_position=1.0, info={}) == pytest.approx(-0.01)
 
 
 def test_sharpe_reward_smooths_over_window() -> None:
@@ -183,17 +199,42 @@ def test_sharpe_reward_smooths_over_window() -> None:
 
 
 def test_composite_sums_components() -> None:
+    # Use a long->short flip to trigger the turnover penalty (since
+    # the penalty now fires only on direction flips, not on
+    # opening from flat).
     fn = composite(
         PnLReward(as_return=True, scale=1.0),
         TurnoverPenaltyReward(penalty=0.001),
     )
     out = fn(
         prev_equity=10_000.0, new_equity=10_100.0,
-        prev_position=0.0, new_position=1.0,
+        prev_position=1.0, new_position=-1.0,
         info={},
     )
-    # PnL = +0.01, turnover = -0.001, total = +0.009.
+    # PnL = +0.01, turnover = -0.001 (long->short flip), total = +0.009.
     assert out == pytest.approx(0.009, rel=1e-6)
+
+
+def test_composite_safe_coerces_each_component_independently() -> None:
+    """If one component returns NaN/inf, the others must still
+    contribute. Previously `_safe_float(total)` would collapse the
+    whole composite to 0 once a single NaN entered the sum.
+    """
+
+    def bad_component(**kwargs: object) -> float:
+        return float("nan")
+
+    fn = composite(
+        PnLReward(as_return=True, scale=1.0),
+        bad_component,
+    )
+    out = fn(
+        prev_equity=10_000.0, new_equity=10_100.0,
+        prev_position=0.0, new_position=0.0,
+        info={},
+    )
+    # PnL=0.01, bad=NaN -> coerced to 0 -> total=0.01.
+    assert out == pytest.approx(0.01, rel=1e-6)
 
 
 def test_reward_safely_coerces_non_finite() -> None:
@@ -257,6 +298,40 @@ def test_env_blocks_short_when_disallowed() -> None:
     _, _, _, _, info = env.step(ACTION_SELL)
     assert info["position"] == 0.0
     assert info["fill"]["status"] == "BLOCKED_SHORT_DISABLED"
+
+
+def test_sell_with_slippage_does_not_open_short_when_disallowed() -> None:
+    """Pre-cap notional + post-fill clamp: a SELL with nonzero
+    slippage might fill at a worse price and end up reducing the
+    position by MORE than the long. The post-fill clamp must keep
+    the position at exactly 0 in that case.
+    """
+    df = _build_df([100.0 + i * 0.1 for i in range(40)])
+    adapter = PaperAdapter(
+        initial_balance=10_000.0,
+        commission=FlatCommission(rate=0.0),
+        # 200 bps slippage will make a SELL fill 2% below mark.
+        slippage=FixedSlippage(bps=200.0),
+    )
+    config = EnvConfig(
+        symbol="BTC/USDT",
+        initial_equity=10_000.0,
+        position_fraction=0.5,
+        allow_short=False,
+        warmup_bars=20,
+        observation=ObservationConfig(window_size=8),
+    )
+    env = TradingEnv(df, adapter, config)
+    env.reset()
+    env.step(ACTION_BUY)
+    # Hammer SELL several times so the slippage-induced overshoot
+    # paths are exercised.
+    for _ in range(3):
+        _, _, _, _, info = env.step(ACTION_SELL)
+        assert env._position >= -1e-9, (
+            f"position went short despite allow_short=False: "
+            f"{env._position}; fill={info['fill']}"
+        )
 
 
 def test_sell_caps_to_long_value_when_shorts_disallowed() -> None:
@@ -337,6 +412,49 @@ def test_env_invalid_action_raises() -> None:
     env.reset()
     with pytest.raises(ValueError):
         env.step(99)
+
+
+def test_env_rejects_non_integer_action() -> None:
+    """Float actions must NOT be silently coerced via int(). A policy
+    bug that produces 1.9 should fail fast, not execute BUY.
+    """
+    env = _build_env(closes=[100.0 + i for i in range(40)])
+    env.reset()
+    with pytest.raises(ValueError):
+        env.step(1.9)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        env.step("BUY")  # type: ignore[arg-type]
+
+
+def test_env_config_seed_used_when_reset_seed_omitted() -> None:
+    """Two envs with the same EnvConfig.seed should produce
+    identical observation sequences from reset() (no explicit
+    seed argument). The previous code only honoured the method
+    argument, making the config knob a no-op for the typical
+    `env.reset()` call pattern.
+    """
+    df = _build_df([100.0 + 0.5 * i for i in range(60)])
+
+    def fresh_env() -> TradingEnv:
+        adapter = PaperAdapter(
+            initial_balance=10_000.0,
+            commission=FlatCommission(rate=0.0),
+            slippage=FixedSlippage(bps=0.0),
+        )
+        config = EnvConfig(
+            symbol="BTC/USDT",
+            initial_equity=10_000.0,
+            warmup_bars=20,
+            seed=42,
+            observation=ObservationConfig(window_size=8),
+        )
+        return TradingEnv(df, adapter, config)
+
+    env_a = fresh_env()
+    env_b = fresh_env()
+    obs_a, _ = env_a.reset()
+    obs_b, _ = env_b.reset()
+    np.testing.assert_allclose(obs_a, obs_b)
 
 
 def test_env_rejects_dataframe_missing_columns() -> None:
