@@ -677,6 +677,51 @@ def test_place_order_cancellation_cleans_up_in_flight() -> None:
     _run(scenario())
 
 
+def test_place_order_cancellation_during_post_lock_acquire_still_cleans_up() -> None:
+    """Cancellation between `_post_with_retries` succeeding and the
+    second `async with self._lock` completing must still clear the
+    in-flight slot and resolve the Future. Otherwise concurrent
+    callers can deadlock awaiting a Future that nothing will ever
+    set.
+
+    Engineering the race: we hold `self._lock` from outside the
+    adapter so the second acquisition inside place_order blocks;
+    while it is blocked we cancel the task. The in-flight cleanup
+    must still run via the try/finally and any concurrent caller
+    must observe a resolved Future.
+    """
+    async def scenario() -> None:
+        http = _FakeHttp([HttpResponse(status=202, body=b'{}', headers={})])
+        adapter = MT5Adapter(http_client=http, signer=_signer())
+
+        # Pre-acquire the adapter lock so the post-response lock
+        # await inside place_order blocks.
+        await adapter._lock.acquire()
+        try:
+            first = asyncio.create_task(adapter.place_order(_request("ord-late-cancel")))
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            # Now a concurrent caller parks on the in-flight Future.
+            second = asyncio.create_task(adapter.place_order(_request("ord-late-cancel")))
+            await asyncio.sleep(0)
+
+            # Cancel while `first` is waiting for the lock we hold.
+            first.cancel()
+            await asyncio.sleep(0)
+        finally:
+            # Release the lock so the cleanup paths can run.
+            adapter._lock.release()
+
+        with pytest.raises((asyncio.CancelledError, Exception)):
+            await first
+        # Concurrent waiter must NOT hang: the Future was resolved
+        # by the finally block.
+        result = await asyncio.wait_for(second, timeout=2.0)
+        assert result.status in (OrderStatus.PENDING, OrderStatus.REJECTED)
+
+    _run(scenario())
+
+
 def test_get_open_orders_uses_lock_for_consistent_snapshot() -> None:
     """Sanity: even under no contention, get_open_orders returns a
     coherent snapshot list rather than iterating the live dict.

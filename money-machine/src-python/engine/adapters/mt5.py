@@ -313,41 +313,54 @@ class MT5Adapter(ExecutionAdapter):
         if inflight is not None:
             return await inflight
 
-        # Lock released; the retry loop runs without head-of-line
-        # blocking other client_order_ids.
+        # Lock released for the network call; in-flight Future
+        # parked under the lock above. The whole tail of the method
+        # is wrapped in try/finally so any cancellation point
+        # (during _post_with_retries, between it and the second
+        # lock acquisition, or while we wait for the lock itself)
+        # is followed by a deterministic cleanup: the in-flight
+        # slot is cleared and the Future is resolved, so concurrent
+        # callers cannot deadlock awaiting a Future that nothing
+        # else will ever set.
+        result: Optional[OrderResult] = None
+        cache_result = False
         try:
-            response = await self._post_with_retries(url, headers, body)
-            result = self._result_from_response(request, response)
-        except BaseException as exc:
-            # Catch BaseException so asyncio.CancelledError (which
-            # inherits from BaseException, not Exception) cannot
-            # leak past the in-flight cleanup. Otherwise a cancel
-            # mid-retry would leave the client_order_id parked
-            # forever and concurrent callers would await an
-            # unresolved Future indefinitely.
-            #
-            # Intentionally NOT writing this synthetic REJECTED to
-            # `_order_cache`: this branch handles local task abort,
-            # not a definitive venue outcome. Caching it would
-            # block every later retry of the same client_order_id
-            # without ever talking to the relay again. Concurrent
-            # callers awaiting the in-flight future still see the
-            # synthetic result (so they unblock), but the next
-            # standalone retry can re-sign and re-POST.
-            result = self._rejected(
-                request, f"place_order aborted: {type(exc).__name__}: {exc}"
-            )
-            async with self._lock:
+            try:
+                response = await self._post_with_retries(url, headers, body)
+                result = self._result_from_response(request, response)
+                # A real venue outcome lands in the durable cache.
+                cache_result = True
+            except BaseException as exc:
+                # Synthetic abort result: NOT cached as a
+                # definitive outcome (a fresh standalone retry
+                # must be able to re-sign and re-POST), but still
+                # used to unblock concurrent waiters via the
+                # Future.
+                result = self._rejected(
+                    request,
+                    f"place_order aborted: {type(exc).__name__}: {exc}",
+                )
+                cache_result = False
+                raise
+        finally:
+            try:
+                async with self._lock:
+                    if cache_result and result is not None:
+                        self._order_cache[request.client_order_id] = result
+                    self._in_flight.pop(request.client_order_id, None)
+            except BaseException:
+                # Second cleanup-time cancellation: drop the
+                # in-flight slot synchronously so the Future
+                # resolution below still happens.
                 self._in_flight.pop(request.client_order_id, None)
             if not future.done():
-                future.set_result(result)
-            raise
+                future.set_result(
+                    result
+                    if result is not None
+                    else self._rejected(request, "place_order aborted before result")
+                )
 
-        async with self._lock:
-            self._order_cache[request.client_order_id] = result
-            self._in_flight.pop(request.client_order_id, None)
-        if not future.done():
-            future.set_result(result)
+        assert result is not None
         return result
 
     async def cancel_order(self, client_order_id: str) -> OrderResult:
