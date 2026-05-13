@@ -153,6 +153,11 @@ class SignalPipeline:
         # the pipeline can be used in paper / shadow mode without
         # touching the venue.
         self.execute_live = execute_live
+        # Instance-scoped caches for adapter portfolio snapshots.
+        # Defined here (not as class attributes) so two pipelines
+        # cannot accidentally share state on a mutable dict.
+        self._adapter_balance_cache: float = 0.0
+        self._adapter_positions_cache: Dict[str, float] = {}
 
     # ------------------------------------------------------------------
 
@@ -168,12 +173,36 @@ class SignalPipeline:
         """
         # Refresh adapter portfolio cache up front so `_equity` and
         # `_open_position_count` can stay sync helpers downstream.
-        if self.engine is None and self.adapter is not None:
+        # We do this whenever an adapter is configured (even if a
+        # legacy engine is also present) because the adapter is the
+        # source of truth for whichever backend will actually
+        # execute the trade. Fail CLOSED on read errors: if we
+        # cannot trust the portfolio snapshot we must not approve
+        # new orders against stale state.
+        if self.adapter is not None:
             try:
                 self._adapter_balance_cache = float(await self.adapter.get_balance())
                 self._adapter_positions_cache = dict(await self.adapter.get_positions())
             except Exception as exc:
-                logger.warning("adapter portfolio refresh failed: %s", exc)
+                logger.error(
+                    "Adapter portfolio refresh failed; failing closed: %s", exc
+                )
+                fallback = TradingSignal(
+                    symbol=getattr(self.strategy, "symbol", ""),
+                    action="HOLD",
+                    confidence=0.0,
+                    strategy=getattr(self.strategy, "name", ""),
+                    reasoning=f"adapter portfolio refresh failed: {exc}",
+                )
+                return PipelineResult(
+                    signal=fallback,
+                    risk_decision=RiskDecision(
+                        approved=False,
+                        reason=RejectionReason.INVALID_PORTFOLIO_STATE,
+                        detail=f"adapter portfolio refresh failed: {exc}",
+                    ),
+                    position_size=0.0,
+                )
 
         try:
             signal = self.strategy.generate_signal(df)
@@ -296,9 +325,15 @@ class SignalPipeline:
         bookkeeping layer can override this method or extend the
         snapshot helper.
         """
-        portfolio = self._portfolio()
         equity = self._equity()
         open_positions = self._open_position_count()
+        # daily_pnl and high_water_mark come from the engine
+        # Portfolio if we have one AND the adapter is NOT executing
+        # (otherwise the engine Portfolio is stale relative to
+        # actual fills). When the adapter is the execution backend
+        # these default to 0 / equity; a stateful portfolio decorator
+        # for adapters is the natural follow-up.
+        portfolio = self._portfolio() if self.adapter is None else None
         if portfolio is not None:
             daily_pnl = self._read_metric(portfolio, "daily_pnl", default=0.0)
             unrealised = self._read_metric(portfolio, "calculate_pnl", default=0.0)
@@ -337,18 +372,26 @@ class SignalPipeline:
             return float(default)
 
     def _equity(self) -> float:
+        # When an adapter is the execution backend, the adapter's
+        # balance is the source of truth (it reflects fills that
+        # bypass the legacy engine's Portfolio). Fall back to the
+        # engine's portfolio only when no adapter is configured.
+        if self.adapter is not None:
+            return float(self._adapter_balance_cache)
         portfolio = self._portfolio()
         if portfolio is None:
-            return float(self._adapter_balance_cache)
+            return 0.0
         getter = getattr(portfolio, "get_balance", None)
         if callable(getter):
             return float(getter())
         return float(getattr(portfolio, "balance", 0.0))
 
     def _open_position_count(self) -> int:
+        if self.adapter is not None:
+            return len(self._adapter_positions_cache)
         portfolio = self._portfolio()
         if portfolio is None:
-            return len(self._adapter_positions_cache)
+            return 0
         getter = getattr(portfolio, "get_positions", None)
         positions = getter() if callable(getter) else getattr(portfolio, "positions", {})
         try:
@@ -357,22 +400,20 @@ class SignalPipeline:
             return 0
 
     def _portfolio(self) -> Any:
-        """Return the portfolio-state source for the risk shield.
+        """Return the portfolio-state source for daily PnL and HWM.
 
-        Prefers the legacy engine's portfolio when present (it owns
-        daily_pnl and high_water_mark history); falls back to the
-        adapter when only an adapter is configured (in which case
-        daily_pnl and HWM default to 0 / current balance).
+        Only consulted when no adapter is configured. The engine's
+        Portfolio owns daily_pnl and high_water_mark history that
+        a stateless adapter cannot provide. When an adapter IS the
+        execution backend its balance/positions are read from the
+        cached snapshot in `_equity` / `_open_position_count` and
+        daily_pnl/HWM default to 0/equity.
         """
         if self.engine is not None:
             return getattr(self.engine, "portfolio", None)
         return None
 
-    # Cached adapter snapshots so we do not have to make `_equity`
-    # / `_open_position_count` async. Refreshed at the top of each
-    # `run_once` before the snapshot is built.
-    _adapter_balance_cache: float = 0.0
-    _adapter_positions_cache: Dict[str, float] = {}
+
 
     async def _execute(
         self,

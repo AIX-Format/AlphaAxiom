@@ -581,6 +581,94 @@ def test_adapter_rejection_surfaces_in_pipeline_result() -> None:
     assert "mark price" in (result.execution.get("error") or "")
 
 
+def test_adapter_refresh_failure_fails_closed() -> None:
+    """If the adapter's get_balance / get_positions raises, the
+    pipeline must NOT proceed with stale state. The whole tick
+    must abort with INVALID_PORTFOLIO_STATE and never call the
+    risk shield or place an order.
+    """
+    from engine.adapters import (
+        ExecutionAdapter,
+        OrderRequest,
+        OrderResult,
+        OrderSide,
+        OrderStatus,
+        OrderType,
+    )
+
+    class _BrokenAdapter(ExecutionAdapter):
+        name = "broken"
+
+        async def place_order(self, request: OrderRequest) -> OrderResult:
+            raise AssertionError("must not be called when refresh fails")
+
+        async def cancel_order(self, client_order_id: str) -> OrderResult:
+            raise AssertionError("not used here")
+
+        async def get_open_orders(self):
+            return []
+
+        async def get_positions(self):
+            raise ConnectionError("rpc down")
+
+        async def get_balance(self):
+            raise ConnectionError("rpc down")
+
+    shield = RiskShield(clock=_frozen_clock(T0))
+    pipeline = SignalPipeline(
+        FixedSignalStrategy(_buy_signal()),
+        shield,
+        adapter=_BrokenAdapter(),
+    )
+    result = _run(pipeline.run_once(pd.DataFrame()))
+
+    assert result.executed is False
+    assert result.position_size == 0.0
+    assert result.risk_decision.reason == RejectionReason.INVALID_PORTFOLIO_STATE
+    assert "portfolio refresh failed" in (result.risk_decision.detail or "")
+    # Shield was never consulted (no rule check ran).
+    assert shield.audit_log() == []
+
+
+def test_adapter_state_overrides_stale_engine_portfolio() -> None:
+    """When both an engine and an adapter are supplied, the adapter
+    is the execution backend AND the portfolio source. The legacy
+    engine's Portfolio could be stale (it never sees adapter
+    fills), so using it for the risk snapshot would approve
+    orders the actual exposure should block.
+    """
+    from engine.adapters import PaperAdapter
+
+    # Legacy engine reports a fat 100k balance.
+    portfolio = Portfolio(initial_balance=100_000.0)
+    engine = StubEngine(portfolio=portfolio)
+    # Adapter reports a much smaller 1k balance - the real exposure.
+    adapter = PaperAdapter(initial_balance=1_000.0)
+    adapter.set_mark_price("BTC/USDT", 50_000.0)
+
+    shield = RiskShield(
+        config=RiskConfig(max_position_size_pct=0.20),
+        clock=_frozen_clock(T0),
+    )
+    # Risk per trade tuned so the proposed notional would EASILY
+    # fit inside 20% of the engine's 100k (= 20k cap) but is
+    # OUT OF BOUNDS at 20% of the adapter's 1k (= 200 cap).
+    pipeline = SignalPipeline(
+        FixedSignalStrategy(_buy_signal()),
+        shield,
+        engine=engine,
+        adapter=adapter,
+        config=PipelineConfig(risk_per_trade_pct=0.05, fallback_stop_pct=0.02),
+    )
+
+    result = _run(pipeline.run_once(pd.DataFrame()))
+    # Expectation: position-size rule rejects because we now size
+    # against the adapter's real 1k balance, not the engine's
+    # phantom 100k.
+    assert result.executed is False
+    assert result.risk_decision.reason == RejectionReason.POSITION_SIZE_EXCEEDED
+
+
 def test_drawdown_trip_via_pipeline_flow() -> None:
     """End-to-end: portfolio drops past max_drawdown_pct, next signal
     is rejected with MAX_DRAWDOWN and the shield is in emergency
