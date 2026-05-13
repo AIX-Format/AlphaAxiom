@@ -1,6 +1,16 @@
 {
   "name": "money-machine",
   "version": "0.1.0",
+  "homepage": "https://aqt.axiomid.app",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Moeabdelaziz007/AlphaAxiom.git",
+    "directory": "money-machine"
+  },
+  "bugs": {
+    "url": "https://github.com/Moeabdelaziz007/AlphaAxiom/issues"
+  },
+  "license": "MIT",
   "aix": {
     "stackVersion": "0.369.0",
     "stackCodename": "Echo369",
