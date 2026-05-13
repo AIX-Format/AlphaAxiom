@@ -696,6 +696,10 @@ def test_reset_clears_order_history_so_id_can_be_reused() -> None:
     """After reset(), a previously-used client_order_id must no
     longer be in the history. The idempotency cache is episode-
     scoped; old ids must not bleed into the next episode.
+
+    Passing `initial_balance` to reset() restarts equity from
+    that value, so each post-reset BUY costs against the fresh
+    balance, not the carry-over from the first fill.
     """
     async def scenario() -> None:
         adapter = PaperAdapter(initial_balance=10_000.0)
@@ -709,9 +713,9 @@ def test_reset_clears_order_history_so_id_can_be_reused() -> None:
         # Re-submit the same id; it must fill again (history is clear).
         second = await adapter.place_order(_market_buy("reused-id", notional=1_000.0))
         assert second.status is OrderStatus.FILLED
-        # Both fills happened: total balance debited by 2 * 1000.
+        # Balance after reset = 10_000; one fill of 1_000 = 9_000.
         balance = await adapter.get_balance()
-        assert balance == pytest.approx(8_000.0)
+        assert balance == pytest.approx(9_000.0)
 
     _run(scenario())
 

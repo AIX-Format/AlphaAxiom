@@ -558,6 +558,53 @@ def test_position_observation_is_scale_invariant_weight() -> None:
     assert pos_weight_shib == pytest.approx(0.5, abs=1e-3)
 
 
+def test_paper_adapter_sync_paths_are_thread_safe() -> None:
+    """`place_order_sync` and `reset` are taken by threading.Lock
+    so two sync callers on different threads cannot tear balance /
+    position bookkeeping. Drive 100 concurrent BUYs from a thread
+    pool and confirm the final state is consistent.
+    """
+    import concurrent.futures
+
+    from engine.adapters import OrderRequest, OrderSide, OrderType
+
+    adapter = PaperAdapter(
+        initial_balance=100_000.0,
+        commission=FlatCommission(rate=0.0),
+        slippage=FixedSlippage(bps=0.0),
+    )
+    adapter.set_mark_price("BTC/USDT", 100.0)
+
+    def submit(i: int):
+        return adapter.place_order_sync(OrderRequest(
+            client_order_id=f"thr-{i}",
+            symbol="BTC/USDT",
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            notional=10.0,
+        ))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(submit, range(100)))
+
+    filled = [r for r in results if r.status.value == "FILLED"]
+    rejected = [r for r in results if r.status.value == "REJECTED"]
+    # No torn state: every order either filled or was rejected
+    # with a clean error message; balance and position arithmetic
+    # is internally consistent.
+    assert len(filled) + len(rejected) == 100
+    # Initial balance was 100_000; 100 BUYs of 10 notional each =
+    # 1000 deducted. With no commission/slippage the final balance
+    # must be exactly 99_000 (or less if any were rejected, but
+    # 1000 well under 100k means all 100 fill).
+    import asyncio
+    final_balance = asyncio.run(adapter.get_balance())
+    assert final_balance == pytest.approx(99_000.0, abs=1e-6)
+    # Position is sum of qty (each 10 notional / mark 100 = 0.1).
+    positions = asyncio.run(adapter.get_positions())
+    assert positions["BTC/USDT"] == pytest.approx(10.0, abs=1e-6)
+
+
 def test_paper_adapter_reset_clears_state() -> None:
     """The new `PaperAdapter.reset()` replaces the old pattern of
     poking at `_balance` / `_positions` / `_order_history` from
