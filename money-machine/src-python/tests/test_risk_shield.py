@@ -27,6 +27,8 @@ SRC_PYTHON = Path(__file__).resolve().parent.parent
 if str(SRC_PYTHON) not in sys.path:
     sys.path.insert(0, str(SRC_PYTHON))
 
+import math  # noqa: E402
+
 from engine.risk_shield import (  # noqa: E402
     PortfolioState,
     RejectionReason,
@@ -326,3 +328,116 @@ def test_audit_log_returns_a_snapshot_copy() -> None:
     snapshot.clear()
     # Internal log untouched.
     assert len(shield.audit_log()) == 1
+
+
+# ---------------------------------------------------------------------------
+# RiskConfig bounds validation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_position_size_pct": -0.01},
+        {"max_position_size_pct": 1.5},
+        {"max_position_size_pct": float("nan")},
+        {"max_position_size_pct": float("inf")},
+        {"daily_loss_limit_pct": -0.01},
+        {"daily_loss_limit_pct": 2.0},
+        {"daily_loss_limit_pct": float("nan")},
+        {"max_drawdown_pct": -0.01},
+        {"max_drawdown_pct": 1.5},
+        {"max_drawdown_pct": float("inf")},
+        {"max_concurrent_positions": 0},
+        {"max_concurrent_positions": -3},
+        {"max_concurrent_positions": True},  # bool slips past int check w/o explicit guard
+        {"cooldown_hours": -1.0},
+        {"cooldown_hours": float("nan")},
+        {"cooldown_hours": float("inf")},
+    ],
+)
+def test_risk_config_rejects_out_of_range_values(kwargs) -> None:
+    with pytest.raises(ValueError):
+        RiskConfig(**kwargs)
+
+
+def test_risk_config_accepts_edge_values() -> None:
+    # 0.0 and 1.0 are valid for fractions; cooldown=0 is valid (no
+    # cooldown). These should not raise.
+    RiskConfig(
+        max_position_size_pct=0.0,
+        max_concurrent_positions=1,
+        daily_loss_limit_pct=1.0,
+        max_drawdown_pct=0.0,
+        cooldown_hours=0.0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Portfolio state hardening: NaN/inf and structurally impossible fields
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "state_kwargs",
+    [
+        {"equity": float("nan"), "open_positions": 0, "proposed_notional": 100.0},
+        {"equity": float("inf"), "open_positions": 0, "proposed_notional": 100.0},
+        {
+            "equity": 10_000.0,
+            "open_positions": 0,
+            "proposed_notional": float("nan"),
+        },
+        {
+            "equity": 10_000.0,
+            "open_positions": 0,
+            "proposed_notional": float("inf"),
+        },
+        {
+            "equity": 10_000.0,
+            "open_positions": 0,
+            "proposed_notional": 100.0,
+            "daily_pnl": float("nan"),
+        },
+        {
+            "equity": 10_000.0,
+            "open_positions": -1,
+            "proposed_notional": 100.0,
+        },
+        {
+            "equity": 10_000.0,
+            "open_positions": 0,
+            "proposed_notional": 100.0,
+            "high_water_mark": -500.0,
+        },
+        {
+            "equity": 10_000.0,
+            "open_positions": 0,
+            "proposed_notional": 100.0,
+            "high_water_mark": float("nan"),
+        },
+    ],
+)
+def test_check_rejects_invalid_portfolio_state(state_kwargs) -> None:
+    shield = RiskShield(clock=_frozen_clock(t=T0))
+    state = PortfolioState(**state_kwargs)
+    decision = shield.check(_signal(), state)
+    assert decision.approved is False
+    assert decision.reason == RejectionReason.INVALID_PORTFOLIO_STATE
+    # And the invalid state is logged with its detail string.
+    assert len(shield.audit_log()) == 1
+
+
+def test_check_does_not_get_fooled_by_nan_comparisons() -> None:
+    """NaN comparisons return False, which would silently bypass the
+    `equity > 0` guard if we forgot the explicit isfinite check.
+    """
+    shield = RiskShield(clock=_frozen_clock(t=T0))
+    state = PortfolioState(
+        equity=math.nan,
+        open_positions=0,
+        proposed_notional=100.0,
+    )
+    decision = shield.check(_signal(), state)
+    assert decision.approved is False
+    assert decision.reason == RejectionReason.INVALID_PORTFOLIO_STATE

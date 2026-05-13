@@ -41,6 +41,22 @@ class MeanReversionStrategy(Strategy):
         atr_stop_mult: float = 1.0,
     ) -> None:
         super().__init__(symbol)
+        for name, value in (
+            ("rsi_period", rsi_period),
+            ("bb_period", bb_period),
+            ("atr_period", atr_period),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"{name} must be int >= 1, got {value!r}")
+        if bb_num_std <= 0:
+            raise ValueError(f"bb_num_std must be > 0, got {bb_num_std!r}")
+        if atr_stop_mult <= 0:
+            raise ValueError(f"atr_stop_mult must be > 0, got {atr_stop_mult!r}")
+        if not 0.0 <= rsi_oversold <= rsi_overbought <= 100.0:
+            raise ValueError(
+                "RSI thresholds must satisfy 0 <= oversold <= overbought <= 100, "
+                f"got oversold={rsi_oversold}, overbought={rsi_overbought}"
+            )
         self.rsi_period = rsi_period
         self.rsi_oversold = rsi_oversold
         self.rsi_overbought = rsi_overbought
@@ -56,13 +72,16 @@ class MeanReversionStrategy(Strategy):
             return self._hold(err)
 
         close = df["close"]
-        upper, middle, lower = bollinger_bands(
-            close, period=self.bb_period, num_std=self.bb_num_std
-        )
-        rsi_series = rsi(close, period=self.rsi_period)
-        atr_series = atr(
-            df["high"], df["low"], close, period=self.atr_period
-        )
+        try:
+            upper, middle, lower = bollinger_bands(
+                close, period=self.bb_period, num_std=self.bb_num_std
+            )
+            rsi_series = rsi(close, period=self.rsi_period)
+            atr_series = atr(
+                df["high"], df["low"], close, period=self.atr_period
+            )
+        except ValueError as exc:
+            return self._hold(f"invalid indicator parameters: {exc}")
 
         last_close = float(close.iloc[-1])
         last_upper = upper.iloc[-1]
