@@ -458,10 +458,25 @@ class _OpenPosition:
         reason: str,
         commission_model: CommissionModel,
     ) -> float:
+        """Close the position and stamp the TradeRecord.
+
+        Returns the value to credit back to equity, which is
+        `gross - exit_commission`. The entry commission was already
+        debited from equity when the position opened, so we must NOT
+        return it again here or equity would be double-charged.
+
+        TradeRecord.pnl, by contrast, is the true round-trip net,
+        `gross - exit_commission - entry_commission`. compute_metrics
+        classifies wins and losses by `t.pnl`, so it has to see the
+        fee-inclusive number; otherwise a small gross gain that does
+        not cover both legs of commission would still register as a
+        win and skew win-rate and avg-win/avg-loss.
+        """
         gross = self.unrealised(exit_price)
         exit_notional = self.quantity * exit_price
         exit_commission = commission_model.apply(exit_notional)
-        pnl = gross - exit_commission
+        realised_to_equity = gross - exit_commission
+        net_pnl = realised_to_equity - self.entry_commission
         self.record = TradeRecord(
             entry_time=self.entry_time,
             exit_time=exit_time,
@@ -469,11 +484,11 @@ class _OpenPosition:
             entry_price=self.entry_price,
             exit_price=exit_price,
             quantity=self.quantity,
-            pnl=pnl,
+            pnl=net_pnl,
             commission=self.entry_commission + exit_commission,
             exit_reason=reason,
         )
-        return pnl
+        return realised_to_equity
 
 
 def _same_direction(position: _OpenPosition, signal: TradingSignal) -> bool:

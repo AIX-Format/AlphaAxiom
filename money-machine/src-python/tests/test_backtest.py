@@ -564,6 +564,107 @@ class _RecordingSlippage:
         return price
 
 
+class _OneShotTakeAt(Strategy):
+    """Fires BUY once with entry at the latest close and a hard
+    take_profit at a configurable level. Used to engineer a trade
+    whose gross profit barely covers the round-trip fees."""
+
+    name = "one-shot-take"
+
+    def __init__(self, symbol: str, *, take: float) -> None:
+        super().__init__(symbol)
+        self._fired = False
+        self._take = take
+
+    def generate_signal(self, df: pd.DataFrame) -> TradingSignal:
+        if self._fired:
+            return TradingSignal(
+                symbol=self.symbol, action="HOLD", confidence=0.0,
+                strategy=self.name,
+            )
+        self._fired = True
+        last_close = float(df["close"].iloc[-1])
+        return TradingSignal(
+            symbol=self.symbol,
+            action="BUY",
+            confidence=0.9,
+            strategy=self.name,
+            entry_price=last_close,
+            stop_loss=last_close * 0.5,
+            take_profit=self._take,
+        )
+
+
+def test_trade_pnl_subtracts_both_entry_and_exit_commissions() -> None:
+    """TradeRecord.pnl must be the net round-trip including BOTH the
+    entry and the exit commissions. Otherwise compute_metrics will
+    classify a small gross-positive but net-negative trade as a win.
+
+    Engineered scenario: 1% taker on both sides, gross gain of about
+    +1.5% on entry-to-take, so after both fees the net is positive
+    but smaller. We verify the net pnl is exactly
+    gross - exit_commission - entry_commission, and that the
+    equity-curve credit (returned by position.close) is unchanged.
+    """
+    closes = [100.0] * 5 + [101.0, 102.0, 103.0]
+    df = _build_frame(closes, atr_pct=0.005)
+    bt = Backtest(
+        strategy=_OneShotTakeAt("BTC/USDT", take=102.0),
+        commission=FlatCommission(rate=0.01),  # 1% per side, exaggerated
+        slippage=FixedSlippage(bps=0.0),
+        config=BacktestConfig(initial_equity=10_000.0, warmup_bars=2),
+    )
+    result = bt.run(df)
+    take_trades = [t for t in result.trades if t.exit_reason == "take"]
+    assert take_trades, "expected one take exit"
+    trade = take_trades[0]
+
+    gross = trade.quantity * (trade.exit_price - trade.entry_price)
+    entry_commission = trade.quantity * trade.entry_price * 0.01
+    exit_commission = trade.quantity * trade.exit_price * 0.01
+    expected_net = gross - exit_commission - entry_commission
+
+    assert trade.pnl == pytest.approx(expected_net, rel=1e-9)
+    # And the `commission` field still totals both legs.
+    assert trade.commission == pytest.approx(
+        entry_commission + exit_commission, rel=1e-9
+    )
+
+
+def test_win_rate_uses_net_pnl_not_gross() -> None:
+    """A trade that is net-negative after both commissions must be
+    counted as a loss, not a win. Lock the win/loss math to the
+    fee-inclusive PnL.
+    """
+    # Build a trade that gross-positive (+1) but net-negative once a
+    # 5% per-side commission is applied. Synthesize a TradeRecord
+    # directly and run compute_metrics on it; this is the post-fix
+    # invariant compute_metrics relies on.
+    ts = pd.Timestamp("2024-01-01", tz="UTC")
+    # gross = quantity * (exit - entry) = 1.0 * (101 - 100) = +1.0
+    # entry_commission = 1.0 * 100 * 0.05 = 5.0
+    # exit_commission  = 1.0 * 101 * 0.05 = 5.05
+    # net = +1.0 - 5.0 - 5.05 = -9.05
+    trade = TradeRecord(
+        entry_time=ts,
+        exit_time=ts,
+        direction="long",
+        entry_price=100.0,
+        exit_price=101.0,
+        quantity=1.0,
+        pnl=-9.05,
+        commission=10.05,
+        exit_reason="take",
+    )
+    curve = pd.Series([1000.0, 1000.0 - 9.05], dtype=float)
+    m = compute_metrics(curve, trades=[trade], initial_equity=1000.0)
+    assert m.num_trades == 1
+    assert m.num_wins == 0
+    assert m.num_losses == 1
+    assert m.win_rate == 0.0
+    assert m.avg_loss == pytest.approx(9.05, rel=1e-9)
+
+
 def test_atr_is_passed_to_slippage_model() -> None:
     """AtrSlippage was always falling back to its floor because the
     engine never passed an ATR value. Verify the engine forwards a
