@@ -202,7 +202,25 @@ class TradingEnv(gym.Env):
 
         # Mutable episode state. reset() resets everything.
         self._current_bar: int = self.config.warmup_bars
-        self._initial_equity: float = float(self.config.initial_equity)
+        # Validate the equity floor before storing it. A zero
+        # initial_equity would explode `equity_norm = equity /
+        # initial - 1` in _build_observation with ZeroDivisionError
+        # on the very first reset; a non-finite value would seed
+        # the observation with NaN and silently violate the
+        # declared Box(-10, 10) contract every step thereafter.
+        try:
+            initial = float(self.config.initial_equity)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"EnvConfig.initial_equity must be numeric, got "
+                f"{self.config.initial_equity!r}"
+            ) from exc
+        if not math.isfinite(initial) or initial <= 0:
+            raise ValueError(
+                f"EnvConfig.initial_equity must be a finite positive "
+                f"number, got {self.config.initial_equity!r}"
+            )
+        self._initial_equity: float = initial
         self._equity: float = self._initial_equity
         self._peak_equity: float = self._initial_equity
         self._position: float = 0.0

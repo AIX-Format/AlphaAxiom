@@ -353,6 +353,28 @@ def test_observation_config_rejects_zero_window() -> None:
         ObservationConfig(rsi_period=0)
 
 
+def test_env_rejects_non_positive_initial_equity() -> None:
+    """`equity_norm = equity / initial_equity - 1` in the
+    observation builder would explode on a 0 or non-finite
+    initial_equity. Reject at construction so the failure mode
+    is a clear ValueError, not a runtime crash on the first
+    reset.
+    """
+    df = _build_df([100.0 + i * 0.1 for i in range(40)])
+    adapter = PaperAdapter(initial_balance=10_000.0)
+    for bad in (0.0, -1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="initial_equity"):
+            TradingEnv(
+                df,
+                adapter,
+                EnvConfig(
+                    initial_equity=bad,
+                    warmup_bars=20,
+                    observation=ObservationConfig(window_size=8),
+                ),
+            )
+
+
 def test_sharpe_reward_ignores_non_finite_step_return() -> None:
     """A NaN or inf in info['step_return'] would otherwise poison
     the running accumulators permanently; one bad sample must be
@@ -536,15 +558,16 @@ def test_env_rejects_non_integer_action() -> None:
 
 
 def test_env_config_seed_used_when_reset_seed_omitted() -> None:
-    """Two envs with the same EnvConfig.seed should produce
-    identical observation sequences from reset() (no explicit
-    seed argument). The previous code only honoured the method
-    argument, making the config knob a no-op for the typical
-    `env.reset()` call pattern.
+    """Two envs with the same EnvConfig.seed produce identical RNG
+    streams; an env with a DIFFERENT seed produces a different
+    RNG stream. The second assertion is the real teeth: without
+    it the test would pass even if EnvConfig.seed were silently
+    ignored, because the observation sequence is deterministic
+    given the data alone.
     """
     df = _build_df([100.0 + 0.5 * i for i in range(60)])
 
-    def fresh_env() -> TradingEnv:
+    def fresh_env(seed: int) -> TradingEnv:
         adapter = PaperAdapter(
             initial_balance=10_000.0,
             commission=FlatCommission(rate=0.0),
@@ -554,16 +577,25 @@ def test_env_config_seed_used_when_reset_seed_omitted() -> None:
             symbol="BTC/USDT",
             initial_equity=10_000.0,
             warmup_bars=20,
-            seed=42,
+            seed=seed,
             observation=ObservationConfig(window_size=8),
         )
         return TradingEnv(df, adapter, config)
 
-    env_a = fresh_env()
-    env_b = fresh_env()
+    env_a = fresh_env(42)
+    env_b = fresh_env(42)
+    env_c = fresh_env(7)
     obs_a, _ = env_a.reset()
     obs_b, _ = env_b.reset()
+    obs_c, _ = env_c.reset()
     np.testing.assert_allclose(obs_a, obs_b)
+    # Negative control: a different seed must drive a different
+    # numpy RNG stream. If reset() silently ignored EnvConfig.seed
+    # both env_a and env_c would draw from the same default-seeded
+    # generator and this assertion would fail.
+    draw_a = env_a.np_random.integers(0, 1_000_000)
+    draw_c = env_c.np_random.integers(0, 1_000_000)
+    assert draw_a != draw_c
 
 
 def test_env_rejects_dataframe_missing_columns() -> None:
@@ -770,7 +802,7 @@ def test_env_rejects_warmup_bars_less_than_window_size() -> None:
         warmup_bars=5,
         observation=ObservationConfig(window_size=16),
     )
-    with pytest.raises(ValueError, match="warmup_bars must be >= observation.window_size"):
+    with pytest.raises(ValueError, match=r"warmup_bars must be >= observation\.window_size"):
         TradingEnv(df, adapter, config)
 
 
