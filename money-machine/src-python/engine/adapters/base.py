@@ -204,9 +204,9 @@ class ExecutionAdapter(abc.ABC):
         eliminates the silent-priority ambiguity between adapters),
         and finite numbers in the price fields.
         """
-        if not request.client_order_id:
+        if not isinstance(request.client_order_id, str) or not request.client_order_id.strip():
             return "client_order_id is required"
-        if not request.symbol or not request.symbol.strip():
+        if not isinstance(request.symbol, str) or not request.symbol.strip():
             return "symbol is required"
         if not isinstance(request.side, OrderSide):
             return f"side must be an OrderSide enum, got {type(request.side).__name__}"
@@ -248,6 +248,12 @@ class ExecutionAdapter(abc.ABC):
 
 
 def _is_positive(x: Any) -> bool:
+    # bool is a subclass of int in Python; True/False would silently
+    # pass float() + isfinite() and produce 1.0 / 0.0. That is almost
+    # never what the caller meant for a quantity or notional, so we
+    # reject it explicitly.
+    if isinstance(x, bool):
+        return False
     try:
         v = float(x)
     except (TypeError, ValueError):

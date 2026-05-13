@@ -125,6 +125,50 @@ def test_validate_request_rejects_whitespace_symbol() -> None:
     assert err is not None and "symbol" in err
 
 
+def test_validate_request_rejects_non_string_symbol() -> None:
+    """Non-string symbol must not raise AttributeError inside
+    `.strip()`; reject with the standard error string instead.
+    """
+    req = OrderRequest(
+        client_order_id="x",
+        symbol=12345,  # type: ignore[arg-type]
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        notional=1_000.0,
+    )
+    err = ExecutionAdapter._validate_request(req)
+    assert err is not None and "symbol" in err
+
+
+def test_validate_request_rejects_non_string_client_order_id() -> None:
+    req = OrderRequest(
+        client_order_id=42,  # type: ignore[arg-type]
+        symbol="BTC/USDT",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        notional=1_000.0,
+    )
+    err = ExecutionAdapter._validate_request(req)
+    assert err is not None and "client_order_id" in err
+
+
+def test_validate_request_rejects_bool_as_sizing() -> None:
+    """bool is a subclass of int in Python; True passes isinstance
+    and yields float(True) == 1.0, which would silently sneak a
+    1.0-unit order through validation. _is_positive now rejects.
+    """
+    req = OrderRequest(
+        client_order_id="x",
+        symbol="BTC/USDT",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=True,  # type: ignore[arg-type]
+    )
+    err = ExecutionAdapter._validate_request(req)
+    assert err is not None
+    assert "quantity" in err
+
+
 def test_validate_request_rejects_both_quantity_and_notional() -> None:
     """Setting BOTH creates ambiguous semantics; callers must pick one."""
     req = OrderRequest(
