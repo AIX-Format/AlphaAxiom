@@ -1,0 +1,421 @@
+"""
+Tests for the execution adapter abstraction and the paper adapter.
+
+The paper adapter is the production-grade reference implementation
+for the `ExecutionAdapter` contract. Locking down its behaviour
+gives us a baseline every future adapter (MT5, CCXT, EVM, Solana)
+can be tested against.
+
+Coverage:
+
+  - OrderRequest / OrderResult / Fill dataclass invariants and the
+    central `_validate_request` helper on the base class.
+  - PaperAdapter happy path: market BUY and SELL fills update
+    balance and positions correctly.
+  - Idempotency: same client_order_id returns the original result
+    without re-debiting balance or growing the position.
+  - Limit orders: park as PENDING when not fillable, then fill on
+    `process_open_orders` after `set_mark_price` clears them.
+  - Cancellation: cancels a pending order, no-ops on already-done
+    orders, and synthesises a rejection on unknown ids.
+  - Cost model integration: commission and slippage actually affect
+    the recorded fill and the resulting balance.
+  - Rejection paths: missing mark, invalid request, non-positive
+    quantity.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import sys
+from pathlib import Path
+from typing import Optional
+
+import pytest
+
+SRC_PYTHON = Path(__file__).resolve().parent.parent
+if str(SRC_PYTHON) not in sys.path:
+    sys.path.insert(0, str(SRC_PYTHON))
+
+from engine.adapters import (  # noqa: E402
+    AdapterError,
+    ExecutionAdapter,
+    OrderRequest,
+    OrderResult,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    PaperAdapter,
+)
+from engine.backtest import FixedSlippage, FlatCommission  # noqa: E402
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def _market_buy(
+    client_id: str,
+    *,
+    symbol: str = "BTC/USDT",
+    notional: Optional[float] = 1_000.0,
+    quantity: Optional[float] = None,
+) -> OrderRequest:
+    return OrderRequest(
+        client_order_id=client_id,
+        symbol=symbol,
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        notional=notional,
+        quantity=quantity,
+    )
+
+
+def _market_sell(
+    client_id: str,
+    *,
+    symbol: str = "BTC/USDT",
+    quantity: float = 0.05,
+) -> OrderRequest:
+    return OrderRequest(
+        client_order_id=client_id,
+        symbol=symbol,
+        side=OrderSide.SELL,
+        order_type=OrderType.MARKET,
+        quantity=quantity,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Request validation (base class helper)
+# ---------------------------------------------------------------------------
+
+
+def test_validate_request_accepts_well_formed_market_order() -> None:
+    req = _market_buy("abc")
+    assert ExecutionAdapter._validate_request(req) is None
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"client_order_id": ""},
+        {"notional": -10.0, "quantity": None},
+        {"notional": 0.0, "quantity": None},
+        {"notional": float("nan"), "quantity": None},
+        {"notional": None, "quantity": None},
+        {"notional": None, "quantity": -1.0},
+        {"notional": None, "quantity": float("inf")},
+    ],
+)
+def test_validate_request_rejects_bad_market_orders(kwargs) -> None:
+    base = dict(
+        client_order_id="x",
+        symbol="BTC/USDT",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        notional=1_000.0,
+        quantity=None,
+    )
+    base.update(kwargs)
+    req = OrderRequest(**base)
+    assert ExecutionAdapter._validate_request(req) is not None
+
+
+def test_validate_request_requires_limit_price_for_limit_orders() -> None:
+    req = OrderRequest(
+        client_order_id="x",
+        symbol="BTC/USDT",
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        notional=1_000.0,
+        limit_price=None,
+    )
+    err = ExecutionAdapter._validate_request(req)
+    assert err is not None and "LIMIT" in err
+
+
+def test_validate_request_rejects_invalid_stop_or_take() -> None:
+    base = dict(
+        client_order_id="x",
+        symbol="BTC/USDT",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        notional=1_000.0,
+    )
+    err = ExecutionAdapter._validate_request(
+        OrderRequest(stop_loss=-1.0, **base)
+    )
+    assert err is not None
+    err = ExecutionAdapter._validate_request(
+        OrderRequest(take_profit=float("nan"), **base)
+    )
+    assert err is not None
+
+
+# ---------------------------------------------------------------------------
+# OrderResult invariants
+# ---------------------------------------------------------------------------
+
+
+def test_order_result_open_and_done_flags() -> None:
+    pending = OrderResult(
+        client_order_id="a",
+        venue_order_id="v",
+        symbol="BTC/USDT",
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        status=OrderStatus.PENDING,
+    )
+    filled = OrderResult(
+        client_order_id="b",
+        venue_order_id="v",
+        symbol="BTC/USDT",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        status=OrderStatus.FILLED,
+    )
+    assert pending.is_open and not pending.is_done
+    assert filled.is_done and not filled.is_open
+
+
+# ---------------------------------------------------------------------------
+# PaperAdapter: market orders happy path
+# ---------------------------------------------------------------------------
+
+
+def test_paper_adapter_market_buy_updates_balance_and_positions() -> None:
+    async def scenario() -> None:
+        adapter = PaperAdapter(initial_balance=10_000.0)
+        adapter.set_mark_price("BTC/USDT", 50_000.0)
+
+        result = await adapter.place_order(_market_buy("o1", notional=5_000.0))
+
+        assert result.status is OrderStatus.FILLED
+        assert result.symbol == "BTC/USDT"
+        # 5000 / 50000 = 0.1 BTC
+        assert result.filled_quantity == pytest.approx(0.1)
+        assert result.average_fill_price == pytest.approx(50_000.0)
+
+        # Balance dropped by 5000, position increased by 0.1.
+        assert (await adapter.get_balance()) == pytest.approx(5_000.0)
+        positions = await adapter.get_positions()
+        assert positions == {"BTC/USDT": pytest.approx(0.1)}
+
+    _run(scenario())
+
+
+def test_paper_adapter_market_sell_closes_long_position() -> None:
+    async def scenario() -> None:
+        adapter = PaperAdapter(initial_balance=10_000.0)
+        adapter.set_mark_price("BTC/USDT", 50_000.0)
+
+        await adapter.place_order(_market_buy("o1", notional=5_000.0))
+        result = await adapter.place_order(_market_sell("o2", quantity=0.1))
+
+        assert result.status is OrderStatus.FILLED
+        # Sold 0.1 at 50k -> +5000 cash, position back to 0.
+        assert (await adapter.get_balance()) == pytest.approx(10_000.0)
+        assert (await adapter.get_positions()) == {}
+
+    _run(scenario())
+
+
+def test_paper_adapter_requires_mark_price() -> None:
+    async def scenario() -> None:
+        adapter = PaperAdapter(initial_balance=10_000.0)
+        result = await adapter.place_order(_market_buy("o1"))
+        assert result.status is OrderStatus.REJECTED
+        assert "mark price" in (result.error or "")
+        # Balance untouched.
+        assert (await adapter.get_balance()) == pytest.approx(10_000.0)
+
+    _run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# Idempotency
+# ---------------------------------------------------------------------------
+
+
+def test_paper_adapter_is_idempotent_on_client_order_id() -> None:
+    async def scenario() -> None:
+        adapter = PaperAdapter(initial_balance=10_000.0)
+        adapter.set_mark_price("BTC/USDT", 50_000.0)
+
+        first = await adapter.place_order(_market_buy("o1", notional=5_000.0))
+        # Re-submit the same client_order_id; must return the same result
+        # without touching balance or positions again.
+        second = await adapter.place_order(_market_buy("o1", notional=5_000.0))
+
+        assert first is second or first == second
+        assert (await adapter.get_balance()) == pytest.approx(5_000.0)
+        assert (await adapter.get_positions()) == {"BTC/USDT": pytest.approx(0.1)}
+
+    _run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# Limit orders, pending fills, cancellation
+# ---------------------------------------------------------------------------
+
+
+def test_limit_buy_parks_pending_then_fills_after_mark_drop() -> None:
+    async def scenario() -> None:
+        adapter = PaperAdapter(initial_balance=10_000.0)
+        adapter.set_mark_price("BTC/USDT", 50_000.0)
+
+        # Buy limit at 48000 with mark at 50000: should park PENDING.
+        req = OrderRequest(
+            client_order_id="lim1",
+            symbol="BTC/USDT",
+            side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            notional=4_800.0,
+            limit_price=48_000.0,
+        )
+        result = await adapter.place_order(req)
+        assert result.status is OrderStatus.PENDING
+        open_orders = await adapter.get_open_orders()
+        assert len(open_orders) == 1
+        # Balance untouched while pending.
+        assert (await adapter.get_balance()) == pytest.approx(10_000.0)
+
+        # Mark drops to 47500 (below the limit). Process should fill it.
+        adapter.set_mark_price("BTC/USDT", 47_500.0)
+        filled = await adapter.process_open_orders()
+        assert len(filled) == 1
+        assert filled[0].status is OrderStatus.FILLED
+        # Buy limit fills at min(limit, mark) = 47500.
+        assert filled[0].average_fill_price == pytest.approx(47_500.0)
+        # Open orders is now empty.
+        assert (await adapter.get_open_orders()) == []
+
+    _run(scenario())
+
+
+def test_cancel_pending_limit_order_returns_cancelled() -> None:
+    async def scenario() -> None:
+        adapter = PaperAdapter(initial_balance=10_000.0)
+        adapter.set_mark_price("BTC/USDT", 50_000.0)
+        req = OrderRequest(
+            client_order_id="lim1",
+            symbol="BTC/USDT",
+            side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            notional=1_000.0,
+            limit_price=40_000.0,
+        )
+        await adapter.place_order(req)
+
+        cancelled = await adapter.cancel_order("lim1")
+        assert cancelled.status is OrderStatus.CANCELLED
+        assert (await adapter.get_open_orders()) == []
+
+        # Cancelling again is a no-op that returns the same CANCELLED.
+        again = await adapter.cancel_order("lim1")
+        assert again.status is OrderStatus.CANCELLED
+
+    _run(scenario())
+
+
+def test_cancel_unknown_order_id_returns_rejection() -> None:
+    async def scenario() -> None:
+        adapter = PaperAdapter(initial_balance=10_000.0)
+        result = await adapter.cancel_order("does-not-exist")
+        assert result.status is OrderStatus.REJECTED
+        assert "unknown" in (result.error or "").lower()
+
+    _run(scenario())
+
+
+def test_cancel_already_filled_order_is_noop() -> None:
+    async def scenario() -> None:
+        adapter = PaperAdapter(initial_balance=10_000.0)
+        adapter.set_mark_price("BTC/USDT", 50_000.0)
+        await adapter.place_order(_market_buy("o1", notional=1_000.0))
+
+        result = await adapter.cancel_order("o1")
+        # The original FILLED state is preserved; no CANCELLED override.
+        assert result.status is OrderStatus.FILLED
+
+    _run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# Cost model integration
+# ---------------------------------------------------------------------------
+
+
+def test_paper_adapter_charges_commission_on_fill() -> None:
+    async def scenario() -> None:
+        adapter = PaperAdapter(
+            initial_balance=10_000.0,
+            commission=FlatCommission(rate=0.001),  # 10 bps
+            slippage=FixedSlippage(bps=0.0),
+        )
+        adapter.set_mark_price("BTC/USDT", 50_000.0)
+
+        await adapter.place_order(_market_buy("o1", notional=5_000.0))
+
+        # Notional 5000 + commission 5 = 5005 debit.
+        assert (await adapter.get_balance()) == pytest.approx(4_995.0)
+
+    _run(scenario())
+
+
+def test_paper_adapter_applies_slippage_to_fill_price() -> None:
+    async def scenario() -> None:
+        adapter = PaperAdapter(
+            initial_balance=10_000.0,
+            commission=FlatCommission(rate=0.0),
+            slippage=FixedSlippage(bps=50.0),  # 50 bps = 0.5%
+        )
+        adapter.set_mark_price("BTC/USDT", 100.0)
+
+        result = await adapter.place_order(_market_buy("o1", quantity=10.0))
+        # BUY slips up by 0.5%: fill at 100.5
+        assert result.average_fill_price == pytest.approx(100.5)
+        # Balance debited by 10 * 100.5 = 1005
+        assert (await adapter.get_balance()) == pytest.approx(8_995.0)
+
+    _run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# Rejection paths
+# ---------------------------------------------------------------------------
+
+
+def test_invalid_request_rejected_without_balance_change() -> None:
+    async def scenario() -> None:
+        adapter = PaperAdapter(initial_balance=10_000.0)
+        adapter.set_mark_price("BTC/USDT", 50_000.0)
+
+        bad = OrderRequest(
+            client_order_id="bad",
+            symbol="BTC/USDT",
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            notional=None,
+            quantity=None,  # neither size given
+        )
+        result = await adapter.place_order(bad)
+        assert result.status is OrderStatus.REJECTED
+        assert "either quantity or notional" in (result.error or "")
+        assert (await adapter.get_balance()) == pytest.approx(10_000.0)
+
+    _run(scenario())
+
+
+def test_negative_initial_balance_raises() -> None:
+    with pytest.raises(AdapterError):
+        PaperAdapter(initial_balance=-1.0)
+
+
+def test_set_mark_price_rejects_non_positive() -> None:
+    adapter = PaperAdapter(initial_balance=10_000.0)
+    with pytest.raises(AdapterError):
+        adapter.set_mark_price("BTC/USDT", 0.0)
+    with pytest.raises(AdapterError):
+        adapter.set_mark_price("BTC/USDT", -5.0)
