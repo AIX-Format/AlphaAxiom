@@ -99,11 +99,21 @@ SigningFunction = Callable[[bytes], bytes]
 def canonical_payload(payload: Dict[str, Any]) -> bytes:
     """Deterministic JSON serialisation for signing.
 
-    Sorted keys, no whitespace, UTF-8 encoded. The Worker side MUST
-    use the same canonicalisation; any whitespace divergence breaks
-    verification.
+    Sorted keys, no whitespace, UTF-8 encoded. `ensure_ascii=False`
+    so non-ASCII characters (e.g. an Arabic strategy name, a
+    Unicode comment) are emitted as raw UTF-8 bytes; that matches
+    what JavaScript's `JSON.stringify` produces on the Worker side
+    and is required for Ed25519 signature verification to succeed
+    across languages. Python's default `ensure_ascii=True` would
+    emit `\\uXXXX` escape sequences and break verification on the
+    very first non-ASCII payload.
     """
-    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -315,11 +325,19 @@ class MT5Adapter(ExecutionAdapter):
             # mid-retry would leave the client_order_id parked
             # forever and concurrent callers would await an
             # unresolved Future indefinitely.
+            #
+            # Intentionally NOT writing this synthetic REJECTED to
+            # `_order_cache`: this branch handles local task abort,
+            # not a definitive venue outcome. Caching it would
+            # block every later retry of the same client_order_id
+            # without ever talking to the relay again. Concurrent
+            # callers awaiting the in-flight future still see the
+            # synthetic result (so they unblock), but the next
+            # standalone retry can re-sign and re-POST.
             result = self._rejected(
                 request, f"place_order aborted: {type(exc).__name__}: {exc}"
             )
             async with self._lock:
-                self._order_cache[request.client_order_id] = result
                 self._in_flight.pop(request.client_order_id, None)
             if not future.done():
                 future.set_result(result)

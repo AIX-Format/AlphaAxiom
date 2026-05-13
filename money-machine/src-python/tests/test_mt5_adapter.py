@@ -135,6 +135,22 @@ def test_canonical_payload_is_utf8_bytes() -> None:
     assert out == b'{"symbol":"EUR/USD"}'
 
 
+def test_canonical_payload_preserves_non_ascii_as_utf8() -> None:
+    """Python's default `ensure_ascii=True` would emit `\\uXXXX`
+    escapes; JavaScript's JSON.stringify does not. If we let the
+    default through, the bytes signed on the Python side would
+    differ from what the Worker re-serialises, and every Ed25519
+    verification would fail on non-ASCII payloads.
+    """
+    arabic = canonical_payload({"strategy": "إستراتيجية"})
+    spanish = canonical_payload({"strategy": "mañana"})
+    # Raw UTF-8 bytes, not \uXXXX escapes.
+    assert "إستراتيجية".encode("utf-8") in arabic
+    assert "mañana".encode("utf-8") in spanish
+    assert b"\\u" not in arabic
+    assert b"\\u" not in spanish
+
+
 # ---------------------------------------------------------------------------
 # Signing round trip
 # ---------------------------------------------------------------------------
@@ -613,35 +629,50 @@ def test_place_order_cancellation_cleans_up_in_flight() -> None:
     """If place_order is cancelled mid HTTP retry (asyncio task
     cancellation), the in-flight slot must be cleared and any
     waiting concurrent caller must observe a deterministic result
-    instead of awaiting forever.
+    instead of awaiting forever. The synthetic 'aborted' result
+    must NOT be persisted to `_order_cache`, so a later retry of
+    the same client_order_id can still reach the relay.
     """
     async def scenario() -> None:
-        block_forever = asyncio.Event()
+        gate = asyncio.Event()
+        post_calls = [0]
 
-        async def stalled_http(method, url, headers, body):
-            # Block until cancelled.
-            await block_forever.wait()
-            return HttpResponse(status=202, body=b'{}', headers={})
+        async def gated_http(method, url, headers, body):
+            post_calls[0] += 1
+            if post_calls[0] == 1:
+                # First call blocks until released; the test cancels
+                # the first task before the gate opens.
+                await gate.wait()
+                return HttpResponse(status=202, body=b'{"venue_order_id":"never"}', headers={})
+            # Subsequent calls (the post-abort retry) succeed.
+            return HttpResponse(status=202, body=b'{"venue_order_id":"v-retry"}', headers={})
 
-        adapter = MT5Adapter(http_client=stalled_http, signer=_signer())
+        adapter = MT5Adapter(http_client=gated_http, signer=_signer())
 
         first = asyncio.create_task(adapter.place_order(_request("ord-cancel")))
-        # Let the first task park itself in the in-flight map.
         await asyncio.sleep(0)
         await asyncio.sleep(0)
-        # Now a concurrent caller awaits the in-flight Future.
         second = asyncio.create_task(adapter.place_order(_request("ord-cancel")))
         await asyncio.sleep(0)
 
-        # Cancel the first task. The second must NOT hang forever.
         first.cancel()
         with pytest.raises((asyncio.CancelledError, Exception)):
             await first
-        # The second caller should resolve to the synthetic
-        # "aborted" result the first task set on the future.
+        # Concurrent waiter resolves to the synthetic REJECTED.
         result = await asyncio.wait_for(second, timeout=2.0)
         assert result.status is OrderStatus.REJECTED
         assert "aborted" in (result.error or "")
+
+        # A NEW place_order call for the same client_order_id must
+        # be able to reach the relay; the abort-result was NOT
+        # cached as a definitive outcome.
+        gate.set()
+        retry = await adapter.place_order(_request("ord-cancel"))
+        assert retry.status is OrderStatus.PENDING
+        assert retry.venue_order_id == "v-retry"
+        # Exactly two HTTP calls: the cancelled first one and the
+        # successful retry. The concurrent waiter never POSTed.
+        assert post_calls[0] == 2
 
     _run(scenario())
 
