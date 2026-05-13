@@ -553,8 +553,8 @@ def test_response_non_dict_body_does_not_crash() -> None:
         http = _FakeHttp([HttpResponse(status=202, body=b'["unexpected"]', headers={})])
         adapter = MT5Adapter(http_client=http, signer=_signer())
         result = await adapter.place_order(_request("ord-list"))
-        assert result.status is OrderStatus.PENDING
-        assert result.venue_order_id is None
+        assert result.status is OrderStatus.REJECTED
+        assert "venue_order_id" in (result.error or "")
 
     _run(scenario())
 

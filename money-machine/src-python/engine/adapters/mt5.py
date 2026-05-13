@@ -745,6 +745,11 @@ class MT5Adapter(ExecutionAdapter):
         if 200 <= response.status < 300:
             parsed = _safe_parse_json_dict(response.body)
             venue_id = parsed.get("venue_order_id")
+            if not isinstance(venue_id, str) or not venue_id.strip():
+                return self._rejected(
+                    request,
+                    "relay HTTP success missing required venue_order_id; fail-closed",
+                )
             return OrderResult(
                 client_order_id=request.client_order_id,
                 venue_order_id=venue_id,
