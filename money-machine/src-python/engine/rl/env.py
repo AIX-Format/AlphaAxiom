@@ -76,12 +76,30 @@ class ObservationConfig:
         equity / initial_equity - 1
 
     Total dimension = window_size + 5. Float32 throughout.
+
+    All fields are validated at construction: zero or negative
+    `window_size` would produce an empty observation and crash on
+    `closes[-1]` during `_build_observation`. Catching it here
+    surfaces a clear ValueError instead of a runtime IndexError
+    on the first call to `reset`.
     """
 
     window_size: int = 64
     rsi_period: int = 14
     ema_period: int = 20
     atr_period: int = 14
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("window_size", self.window_size),
+            ("rsi_period", self.rsi_period),
+            ("ema_period", self.ema_period),
+            ("atr_period", self.atr_period),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(
+                    f"ObservationConfig.{name} must be int >= 1, got {value!r}"
+                )
 
 
 @dataclass
@@ -233,6 +251,14 @@ class TradingEnv(gym.Env):
         # Use the adapter's public reset hook instead of reaching
         # into its underscore-prefixed state.
         self.adapter.reset(initial_balance=self._initial_equity)
+        # Stateful reward functions (e.g. SharpeRatioReward with
+        # its rolling deque + running sums) need to forget the
+        # previous episode's returns. Without this their state
+        # bleeds across episode boundaries and the first N rewards
+        # of episode K are contaminated by the tail of episode K-1.
+        reset_hook = getattr(self.reward_fn, "reset_state", None)
+        if callable(reset_hook):
+            reset_hook()
         self._set_mark(self._current_bar)
 
         obs = self._build_observation()
@@ -470,28 +496,44 @@ class TradingEnv(gym.Env):
         if action == ACTION_HOLD or notional <= 0 or mark <= 0:
             return {"status": "HOLD"}
 
+        # Build the OrderRequest. For SELL with allow_short=False
+        # we send an explicit `quantity` (not `notional`) capped to
+        # the current long. With notional-sized SELLs the adapter
+        # computes qty = notional / fill_price, and a negative
+        # slippage drops fill_price below mark, making qty exceed
+        # the intended close. That would drive both the env's
+        # position AND the adapter's internal position negative
+        # (a "phantom short"), and the env's post-clamp could not
+        # repair the adapter side, inflating equity on later steps.
+        # Sending `quantity` directly fixes the bug at its source:
+        # the adapter sells exactly the amount we asked for,
+        # regardless of where the fill lands.
+        request_kwargs: Dict[str, float] = {}
         if action == ACTION_BUY:
             side = OrderSide.BUY
+            request_kwargs["notional"] = float(notional)
         else:  # ACTION_SELL
             if not self.config.allow_short:
                 if self._position <= 0:
-                    # Cannot open a short when shorts are disabled.
                     return {"status": "BLOCKED_SHORT_DISABLED"}
-                # Cap notional to the current long's value so the
-                # SELL closes (or partially closes) the position
-                # without flipping it into a short.
-                max_close_notional = self._position * mark
-                if max_close_notional <= 0:
+                # Intended quantity at the current mark, capped to
+                # the available long. Using `quantity=` guarantees
+                # the adapter cannot oversell regardless of slippage.
+                intended_qty = min(notional / mark, self._position)
+                if intended_qty <= 0:
                     return {"status": "BLOCKED_SHORT_DISABLED"}
-                notional = min(notional, max_close_notional)
-            side = OrderSide.SELL
+                side = OrderSide.SELL
+                request_kwargs["quantity"] = float(intended_qty)
+            else:
+                side = OrderSide.SELL
+                request_kwargs["notional"] = float(notional)
 
         request = OrderRequest(
             client_order_id=f"rl-{self._step_id}-{uuid.uuid4().hex[:6]}",
             symbol=self.config.symbol,
             side=side,
             order_type=OrderType.MARKET,
-            notional=float(notional),
+            **request_kwargs,
         )
 
         # Synchronous fill path: no asyncio.run, no event-loop
@@ -504,15 +546,12 @@ class TradingEnv(gym.Env):
                 self._position += qty
             else:
                 self._position -= qty
-                # Post-fill clamp: with slippage, a SELL whose
-                # notional was pre-capped to `position * mark` can
-                # still produce a quantity slightly larger than
-                # `self._position` (the fill price ends up below
-                # `mark`, so `qty = notional / fill_price >
-                # position`). Without this clamp, `allow_short=
-                # False` could be silently violated. We clip the
-                # position back to zero and surface the deviation
-                # in the fill info so reward functions can see it.
+                # Defence-in-depth post-fill clamp: the
+                # quantity= path above should make this branch
+                # unreachable, but float rounding on extreme slip
+                # could still leave self._position at -1e-15.
+                # Snap to exactly 0 if so. The adapter's position
+                # tracks the qty we actually sold, which matches.
                 if not self.config.allow_short and self._position < 0:
                     overshoot = -self._position
                     self._position = 0.0
@@ -569,3 +608,22 @@ class TradingEnv(gym.Env):
         missing = [c for c in ("open", "high", "low", "close", "volume") if c not in data.columns]
         if missing:
             raise ValueError(f"missing OHLCV columns: {missing}")
+        # Reject non-finite price/volume rows up front. NaN slips
+        # past `np.clip` in the observation builder and would leak
+        # outside the declared Box(-10, 10) bounds, failing the
+        # Gymnasium env_checker mid-episode. Prices must also be
+        # strictly positive (a zero/negative price would corrupt
+        # the normalisation-by-latest-close in _build_observation).
+        for col in ("open", "high", "low", "close"):
+            arr = data[col].to_numpy(dtype=np.float64)
+            if not np.isfinite(arr).all():
+                raise ValueError(
+                    f"OHLCV column {col!r} contains NaN or inf values"
+                )
+            if (arr <= 0).any():
+                raise ValueError(
+                    f"OHLCV column {col!r} contains non-positive values"
+                )
+        vol = data["volume"].to_numpy(dtype=np.float64)
+        if not np.isfinite(vol).all():
+            raise ValueError("OHLCV column 'volume' contains NaN or inf values")

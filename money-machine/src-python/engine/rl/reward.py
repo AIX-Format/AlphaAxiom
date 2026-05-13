@@ -255,16 +255,32 @@ class SharpeRatioReward:
     _running_sumsq: float = field(init=False, default=0.0)
 
     def __post_init__(self) -> None:
-        # Size the deque to the configured window. `init=False`
-        # keeps callers from constructing a deque with the wrong
-        # maxlen by accident.
+        """Initialise the rolling buffer and validate `window`.
+
+        A window of 0 produces a deque with `maxlen=0`: every
+        append is a silent no-op AND the eviction branch in
+        `__call__` indexes `self._returns[0]` immediately on an
+        empty deque, raising IndexError. Reject misconfigured
+        windows at construction so the failure mode is a clear
+        ValueError, not a runtime crash mid-training.
         """
-        Initialize internal rolling window and running totals used to compute the Sharpe ratio.
-        
-        Sets up a deque sized to `self.window` for recent returns and initializes `_running_sum`
-        and `_running_sumsq` to 0.0.
-        """
+        if not isinstance(self.window, int) or isinstance(self.window, bool) or self.window < 1:
+            raise ValueError(
+                f"SharpeRatioReward.window must be int >= 1, got {self.window!r}"
+            )
         self._returns = deque(maxlen=self.window)
+        self._running_sum = 0.0
+        self._running_sumsq = 0.0
+
+    def reset_state(self) -> None:
+        """Drop the rolling window so the next call starts fresh.
+
+        Called by `TradingEnv.reset()` between episodes. Without
+        this hook the deque + running totals carry over and the
+        first few rewards of episode K mix in returns from
+        episode K-1, biasing learning curves.
+        """
+        self._returns.clear()
         self._running_sum = 0.0
         self._running_sumsq = 0.0
 
@@ -279,14 +295,29 @@ class SharpeRatioReward:
     ) -> float:
         """
         Compute a rolling Sharpe ratio from recent step returns and return its scaled value.
-        
+
         Parameters:
             info (dict): May contain `"step_return"` (float) with the latest step return; defaults to 0.0 if missing.
-        
+
         Returns:
             float: The scaled Sharpe ratio (mean / sqrt(variance)) over the internal window; `0.0` if fewer than two returns are available or if variance is effectively zero.
         """
-        step_return = float(info.get("step_return", 0.0))
+        # Sanitize before mutating the running accumulators. A
+        # single NaN/inf in `info["step_return"]` would otherwise
+        # permanently poison `_running_sum` and `_running_sumsq`;
+        # every later step's variance computation would be NaN and
+        # `_safe_float(scale * sharpe)` would collapse to 0,
+        # silently turning the reward into a constant for the rest
+        # of the run. Coerce the bad sample to 0 instead so the
+        # accumulators stay finite and recover on the next clean
+        # tick.
+        raw_return = info.get("step_return", 0.0)
+        try:
+            step_return = float(raw_return)
+        except (TypeError, ValueError):
+            step_return = 0.0
+        if not math.isfinite(step_return):
+            step_return = 0.0
         if len(self._returns) == self._returns.maxlen:
             # About to evict the oldest value; subtract it from
             # the running totals so the maths stays O(1).
@@ -369,4 +400,14 @@ def composite(*parts: RewardFunction) -> RewardFunction:
             )
         return _safe_float(total)
 
+    def _reset_state() -> None:
+        """Fan reset out to any stateful component."""
+        for fn in parts_tuple:
+            hook = getattr(fn, "reset_state", None)
+            if callable(hook):
+                hook()
+
+    # Attach the reset hook so the env's
+    # `getattr(self.reward_fn, "reset_state", None)` check finds it.
+    _combined.reset_state = _reset_state  # type: ignore[attr-defined]
     return _combined

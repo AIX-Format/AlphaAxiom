@@ -301,16 +301,16 @@ def test_env_blocks_short_when_disallowed() -> None:
 
 
 def test_sell_with_slippage_does_not_open_short_when_disallowed() -> None:
-    """Pre-cap notional + post-fill clamp: a SELL with nonzero
-    slippage might fill at a worse price and end up reducing the
-    position by MORE than the long. The post-fill clamp must keep
-    the position at exactly 0 in that case.
+    """Both the env's `_position` AND the adapter's tracked
+    position must stay non-negative when shorts are disabled,
+    even with large sell-slippage. Sending `quantity=` (not
+    `notional=`) for the close prevents adapter overshoot at the
+    source; the post-fill clamp is a belt-and-suspenders.
     """
     df = _build_df([100.0 + i * 0.1 for i in range(40)])
     adapter = PaperAdapter(
         initial_balance=10_000.0,
         commission=FlatCommission(rate=0.0),
-        # 200 bps slippage will make a SELL fill 2% below mark.
         slippage=FixedSlippage(bps=200.0),
     )
     config = EnvConfig(
@@ -324,14 +324,123 @@ def test_sell_with_slippage_does_not_open_short_when_disallowed() -> None:
     env = TradingEnv(df, adapter, config)
     env.reset()
     env.step(ACTION_BUY)
-    # Hammer SELL several times so the slippage-induced overshoot
-    # paths are exercised.
     for _ in range(3):
         _, _, _, _, info = env.step(ACTION_SELL)
         assert env._position >= -1e-9, (
-            f"position went short despite allow_short=False: "
-            f"{env._position}; fill={info['fill']}"
+            f"env position went short: {env._position}; fill={info['fill']}"
         )
+        # Critical: also verify the adapter's internal position
+        # never goes negative. Previously the env clamped its own
+        # _position to 0 but left a "phantom short" on the
+        # adapter, inflating equity on later steps.
+        adapter_pos = adapter._positions.get("BTC/USDT", 0.0)  # type: ignore[attr-defined]
+        assert adapter_pos >= -1e-9, (
+            f"adapter tracked a short: {adapter_pos}; fill={info['fill']}"
+        )
+
+
+def test_sharpe_reward_rejects_zero_window() -> None:
+    with pytest.raises(ValueError):
+        SharpeRatioReward(window=0)
+    with pytest.raises(ValueError):
+        SharpeRatioReward(window=-3)
+
+
+def test_observation_config_rejects_zero_window() -> None:
+    with pytest.raises(ValueError):
+        ObservationConfig(window_size=0)
+    with pytest.raises(ValueError):
+        ObservationConfig(rsi_period=0)
+
+
+def test_sharpe_reward_ignores_non_finite_step_return() -> None:
+    """A NaN or inf in info['step_return'] would otherwise poison
+    the running accumulators permanently; one bad sample must be
+    treated as 0 so the reward recovers on the next clean tick.
+    """
+    r = SharpeRatioReward(window=10)
+    # Feed clean returns to build up some state.
+    for v in [0.01, -0.005, 0.012, -0.003, 0.008]:
+        r(prev_equity=1.0, new_equity=1.0,
+          prev_position=0.0, new_position=0.0,
+          info={"step_return": v})
+    # Now inject a NaN; the reward must NOT crash and must keep
+    # producing finite values on subsequent clean ticks.
+    r(prev_equity=1.0, new_equity=1.0,
+      prev_position=0.0, new_position=0.0,
+      info={"step_return": float("nan")})
+    out = r(prev_equity=1.0, new_equity=1.0,
+            prev_position=0.0, new_position=0.0,
+            info={"step_return": 0.005})
+    assert np.isfinite(out)
+
+
+def test_env_reset_resets_stateful_reward() -> None:
+    """SharpeRatioReward's deque + running sums must clear between
+    episodes so episode K does not see episode K-1's returns.
+    """
+    sharpe = SharpeRatioReward(window=5)
+    df = _build_df([100.0 + i * 0.5 for i in range(60)])
+    adapter = PaperAdapter(
+        initial_balance=10_000.0,
+        commission=FlatCommission(rate=0.0),
+        slippage=FixedSlippage(bps=0.0),
+    )
+    config = EnvConfig(
+        symbol="BTC/USDT",
+        initial_equity=10_000.0,
+        warmup_bars=20,
+        observation=ObservationConfig(window_size=8),
+    )
+    env = TradingEnv(df, adapter, config, reward=sharpe)
+    env.reset()
+    for _ in range(8):
+        env.step(ACTION_BUY)
+    # The Sharpe accumulator now has a populated window.
+    assert len(sharpe._returns) > 0
+
+    # A reset must drop the rolling buffer.
+    env.reset()
+    assert len(sharpe._returns) == 0
+    assert sharpe._running_sum == 0.0
+    assert sharpe._running_sumsq == 0.0
+
+
+def test_composite_reset_state_fans_out_to_components() -> None:
+    """`composite()` must expose a `reset_state` callable that
+    propagates to every stateful child."""
+    sharpe = SharpeRatioReward(window=5)
+    fn = composite(PnLReward(), sharpe)
+
+    # Populate the Sharpe state via the composite.
+    for v in [0.01, -0.005, 0.012]:
+        fn(prev_equity=1.0, new_equity=1.0,
+           prev_position=0.0, new_position=0.0,
+           info={"step_return": v})
+    assert len(sharpe._returns) == 3
+
+    assert callable(getattr(fn, "reset_state", None))
+    fn.reset_state()  # type: ignore[attr-defined]
+    assert len(sharpe._returns) == 0
+
+
+def test_env_rejects_non_finite_ohlcv() -> None:
+    """NaN/inf prices would slip past `np.clip` in the observation
+    builder and violate the declared Box(-10, 10) contract, then
+    fail the Gymnasium env_checker mid-episode."""
+    df = _build_df([100.0 + i * 0.1 for i in range(40)])
+    df_nan = df.copy()
+    df_nan.iloc[5, df_nan.columns.get_loc("close")] = float("nan")
+    adapter = PaperAdapter(initial_balance=10_000.0)
+    with pytest.raises(ValueError, match="NaN"):
+        TradingEnv(df_nan, adapter, EnvConfig(warmup_bars=20,
+            observation=ObservationConfig(window_size=8)))
+
+    df_neg = df.copy()
+    df_neg.iloc[5, df_neg.columns.get_loc("close")] = -1.0
+    with pytest.raises(ValueError, match="non-positive"):
+        TradingEnv(df_neg, adapter, EnvConfig(warmup_bars=20,
+            observation=ObservationConfig(window_size=8)))
 
 
 def test_sell_caps_to_long_value_when_shorts_disallowed() -> None:
