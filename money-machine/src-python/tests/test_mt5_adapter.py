@@ -408,6 +408,49 @@ def test_cancel_unknown_order_returns_rejection() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_signing_failure_in_place_order_is_not_cached() -> None:
+    """A transient signing failure (HSM blip, keychain race) must
+    not be persisted to _order_cache. A later retry with the same
+    client_order_id must be allowed to re-sign and re-POST.
+
+    Mirror of the fix for cancel_order signing failures: signing
+    is a pre-venue local operation, so no exposure exists. Caching
+    the REJECTED would permanently short-circuit retries until
+    process restart.
+    """
+    async def scenario() -> None:
+        http = _FakeHttp([
+            HttpResponse(status=202, body=b'{"venue_order_id":"v-retry"}', headers={}),
+        ])
+        real = _signer()
+        call_count = [0]
+
+        def flaky_signer(payload: bytes) -> bytes:
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise RuntimeError("transient HSM outage")
+            return real(payload)
+
+        adapter = MT5Adapter(http_client=http, signer=flaky_signer)
+        # First attempt: signing throws -> REJECTED, no HTTP call,
+        # no cache entry.
+        first = await adapter.place_order(_request("ord-retry"))
+        assert first.status is OrderStatus.REJECTED
+        assert "signing failed" in (first.error or "")
+        assert http.calls == []
+
+        # Second attempt with the SAME id: signing succeeds this
+        # time and the order reaches the relay. If we had cached
+        # the first REJECTED, this would return the cached failure
+        # instead and never POST.
+        second = await adapter.place_order(_request("ord-retry"))
+        assert second.status is OrderStatus.PENDING
+        assert second.venue_order_id == "v-retry"
+        assert len(http.calls) == 1
+
+    _run(scenario())
+
+
 def test_cancel_signing_failure_returns_rejected_not_stale() -> None:
     """A signing failure during cancel must NOT silently return the
     stale PENDING order. Surface it as REJECTED with the error

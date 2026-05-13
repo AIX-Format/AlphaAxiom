@@ -287,10 +287,20 @@ class MT5Adapter(ExecutionAdapter):
                     # AdapterError is included here; the adapter
                     # contract is "no exceptions, return REJECTED"
                     # and signing is a routine failure path
-                    # (missing keychain entry, libsodium quirk).
-                    result = self._rejected(request, f"signing failed: {exc}")
-                    self._order_cache[request.client_order_id] = result
-                    return result
+                    # (missing keychain entry, libsodium quirk,
+                    # transient HSM outage).
+                    #
+                    # Intentionally NOT writing this REJECTED to
+                    # `_order_cache`: no request reached the relay,
+                    # so the order has no exposure. Caching a
+                    # signing failure would permanently short-circuit
+                    # every later retry of the same client_order_id
+                    # from cache and prevent the natural retry path
+                    # for a transient HSM blip. The id is also kept
+                    # out of `_in_flight` because we never created
+                    # a Future for it (the placeholder is set after
+                    # signing succeeds).
+                    return self._rejected(request, f"signing failed: {exc}")
 
                 envelope = {
                     "payload": payload,
