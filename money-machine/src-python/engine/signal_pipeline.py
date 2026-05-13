@@ -108,26 +108,24 @@ class PipelineConfig:
 class SignalPipeline:
     """Strategy + risk + sizing + execution, wired end-to-end.
 
-    Two execution backends are supported:
+    Exactly one execution backend must be supplied:
 
-    1. **Adapter** (`ExecutionAdapter` from `engine.adapters`). The
-       pipeline builds an `OrderRequest` from the signal and calls
-       `adapter.place_order`. The returned `OrderResult` is mapped
-       into the execution dict on `PipelineResult.execution`. This
-       is the path every new venue (paper, MT5, CCXT, EVM, Solana)
-       plugs into.
+    - **Adapter** (`ExecutionAdapter` from `engine.adapters`). The
+      pipeline builds an `OrderRequest` from the signal and calls
+      `adapter.place_order`. This is the path every new venue
+      (paper, MT5, CCXT, EVM, Solana) plugs into. The adapter
+      also becomes the portfolio source via `get_balance` /
+      `get_positions`.
 
-    2. **Legacy engine** (`SupportsExecute`). Pre-adapter callers
-       pass an object exposing `engine.execute_trade(params)` and
-       `engine.portfolio`. Kept for backward compatibility so the
-       existing `TradingEngine` keeps working while strategies
-       migrate.
+    - **Legacy engine** (`SupportsExecute`). Pre-adapter callers
+      pass an object exposing `engine.execute_trade(params)` and
+      `engine.portfolio`. Kept for backward compatibility while
+      strategies migrate.
 
-    Exactly one of `adapter` or `engine` must be supplied. Risk
-    shield state (equity, daily PnL, high-water mark) still comes
-    from the portfolio object on the engine when present, or from
-    the adapter's `get_balance` / `get_positions` when only an
-    adapter is given.
+    Supplying BOTH is rejected: mixing them would route execution
+    through the adapter while reading risk-shield state from the
+    engine's stale Portfolio, which is exactly the kind of split
+    book that approves orders against the wrong balance.
     """
 
     def __init__(
@@ -142,7 +140,14 @@ class SignalPipeline:
     ) -> None:
         if adapter is None and engine is None:
             raise ValueError(
-                "SignalPipeline requires either an adapter or a legacy engine"
+                "SignalPipeline requires exactly one execution backend "
+                "(adapter or engine), got neither"
+            )
+        if adapter is not None and engine is not None:
+            raise ValueError(
+                "SignalPipeline requires exactly one execution backend; "
+                "got both adapter and engine. The engine's Portfolio "
+                "would not see adapter fills, leading to a split book."
             )
         self.strategy = strategy
         self.risk_shield = risk_shield
@@ -457,6 +462,13 @@ class SignalPipeline:
         self, signal: TradingSignal, notional: float
     ) -> Dict[str, Any]:
         side = OrderSide.BUY if signal.action == "BUY" else OrderSide.SELL
+        # Preserve strategy-emitted metadata so venue-specific
+        # fields (EVM from_address/to_address, MT5 instrument
+        # overrides, etc.) survive the trip through the pipeline.
+        # The pipeline only adds its own observability fields on
+        # top; it never silently drops what the strategy set.
+        metadata = dict(signal.metadata or {})
+        metadata["signal_timestamp"] = signal.timestamp
         request = OrderRequest(
             client_order_id=self._client_order_id(signal),
             symbol=signal.symbol,
@@ -467,15 +479,23 @@ class SignalPipeline:
             stop_loss=signal.stop_loss,
             take_profit=signal.take_profit,
             strategy=signal.strategy,
-            metadata={"signal_timestamp": signal.timestamp},
+            metadata=metadata,
         )
         try:
             result: OrderResult = await self.adapter.place_order(request)
         except Exception as exc:
             logger.error("adapter.place_order raised: %s", exc)
             return {"success": False, "error": str(exc)}
+        # CANCELLED is a non-success terminal state (venue rejected
+        # the order or cancelled it mid-flight); only PENDING /
+        # PARTIAL / FILLED count as the order actually progressing.
+        successful_statuses = {
+            OrderStatus.PENDING,
+            OrderStatus.PARTIAL,
+            OrderStatus.FILLED,
+        }
         return {
-            "success": result.status not in (OrderStatus.REJECTED,),
+            "success": result.status in successful_statuses,
             "order_id": result.venue_order_id,
             "client_order_id": result.client_order_id,
             "status": result.status.value,
@@ -510,13 +530,33 @@ class SignalPipeline:
     def _client_order_id(signal: TradingSignal) -> str:
         """Stable per-signal client order id.
 
-        Combines the strategy name, symbol, action and timestamp so
-        the same signal flowing through the same pipeline always
-        gets the same id. Adapters use this as the idempotency key,
-        so a retry on a transient error never produces a duplicate
-        order at the venue.
+        Adapters use this as the idempotency key. The contract is
+        "same logical signal -> same id", so a retry on a transient
+        error reuses the existing venue order rather than placing a
+        duplicate. Two requirements that fight each other:
+
+          1. Sub-millisecond signals (fast backtest, tight live
+             loop) must produce DIFFERENT ids; truncating
+             `signal.timestamp` to milliseconds collapsed two
+             distinct events into one.
+          2. Different markets must produce DIFFERENT ids; the old
+             `replace("/", "")` mapping let `AB/CD` and `A/BCD`
+             collide.
+
+        Resolution: keep the strategy + raw symbol + action + full
+        timestamp in the id, hash the whole thing with sha256 (12
+        bytes truncated, base16 encoded) so the result is filesystem
+        / header-safe regardless of input characters. The hash is
+        deterministic on identical inputs and globally distinct on
+        anything else.
         """
-        ts = int(signal.timestamp * 1000)
-        symbol = signal.symbol.replace("/", "").replace(":", "_")
-        strategy = (signal.strategy or "unknown").replace(" ", "_")
-        return f"{strategy}-{symbol}-{signal.action}-{ts}"
+        import hashlib
+
+        ts = float(signal.timestamp)
+        strategy = signal.strategy or "unknown"
+        # Preserve the full timestamp precision so sub-ms distinct
+        # signals do not collide. repr() gives us 17 digits, which
+        # is enough to round-trip a Python float.
+        raw = f"{strategy}|{signal.symbol}|{signal.action}|{ts!r}"
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+        return f"sp-{digest}"

@@ -451,17 +451,13 @@ def test_portfolio_metrics_accept_attribute_form() -> None:
 
 def test_pipeline_routes_through_execution_adapter() -> None:
     """When an ExecutionAdapter is supplied, the pipeline must use
-    it instead of the legacy engine.execute_trade path. The signal
-    must be translated into a well-formed OrderRequest carrying the
-    notional we sized, and the OrderResult's status must surface in
-    the PipelineResult execution dict.
+    it. The signal must be translated into a well-formed
+    OrderRequest carrying the notional we sized, and the
+    OrderResult's status must surface in the PipelineResult
+    execution dict.
     """
-    from engine.adapters import (
-        PaperAdapter,
-    )
+    from engine.adapters import PaperAdapter
 
-    portfolio = Portfolio(initial_balance=10_000.0)
-    engine = StubEngine(portfolio=portfolio)
     shield = RiskShield(clock=_frozen_clock(T0))
     adapter = PaperAdapter(initial_balance=10_000.0)
     adapter.set_mark_price("BTC/USDT", 50_000.0)
@@ -469,7 +465,6 @@ def test_pipeline_routes_through_execution_adapter() -> None:
     pipeline = SignalPipeline(
         FixedSignalStrategy(_buy_signal()),
         shield,
-        engine=engine,
         adapter=adapter,
     )
 
@@ -479,34 +474,25 @@ def test_pipeline_routes_through_execution_adapter() -> None:
     assert result.execution is not None
     assert result.execution["status"] == "FILLED"
     assert result.execution["client_order_id"]
-    # Adapter actually moved balance; legacy engine.execute_trade
-    # was NOT called.
-    assert engine.received == []
     # The paper adapter holds the new position.
     positions = _run(adapter.get_positions())
     assert "BTC/USDT" in positions
 
 
 def test_adapter_idempotency_via_client_order_id() -> None:
-    """Running the same signal twice should produce one position at
-    the adapter, because the client_order_id is deterministic and
-    the adapter dedupes on it.
+    """The adapter dedupes on client_order_id; running the same
+    signal twice within the same instant returns the cached order.
     """
     from engine.adapters import PaperAdapter
 
-    portfolio = Portfolio(initial_balance=10_000.0)
     shield = RiskShield(clock=_frozen_clock(T0))
     adapter = PaperAdapter(initial_balance=10_000.0)
     adapter.set_mark_price("BTC/USDT", 50_000.0)
 
-    # Fixed signal also produces the same timestamp on every call
-    # via the FixedSignalStrategy, so the derived client_order_id
-    # is stable across runs.
     fixed_sig = _buy_signal()
     pipeline = SignalPipeline(
         FixedSignalStrategy(fixed_sig),
         shield,
-        engine=StubEngine(portfolio=portfolio),
         adapter=adapter,
     )
 
@@ -514,12 +500,6 @@ def test_adapter_idempotency_via_client_order_id() -> None:
     second = _run(pipeline.run_once(pd.DataFrame()))
 
     assert first.execution is not None and second.execution is not None
-    # Same client_order_id surfaces on both results, since
-    # FixedSignalStrategy re-stamps with `datetime.now()` per call.
-    # The dedupe contract is on the adapter when ids match exactly,
-    # which only happens within a millisecond. Here we still expect
-    # both to succeed; the important assertion is the FIRST result
-    # populated executed=True.
     assert first.executed is True
     assert second.executed is True
 
@@ -530,6 +510,24 @@ def test_pipeline_requires_adapter_or_engine() -> None:
         SignalPipeline(
             FixedSignalStrategy(_buy_signal()),
             shield,
+        )
+
+
+def test_pipeline_rejects_both_adapter_and_engine() -> None:
+    """Supplying both is the split-book footgun the pipeline now
+    rejects: execution would go through the adapter while risk
+    state would be read from the engine's stale Portfolio.
+    """
+    from engine.adapters import PaperAdapter
+
+    portfolio = Portfolio(initial_balance=10_000.0)
+    shield = RiskShield(clock=_frozen_clock(T0))
+    with pytest.raises(ValueError, match="exactly one"):
+        SignalPipeline(
+            FixedSignalStrategy(_buy_signal()),
+            shield,
+            engine=StubEngine(portfolio=portfolio),
+            adapter=PaperAdapter(initial_balance=1_000.0),
         )
 
 
@@ -561,7 +559,6 @@ def test_adapter_rejection_surfaces_in_pipeline_result() -> None:
     """
     from engine.adapters import PaperAdapter
 
-    portfolio = Portfolio(initial_balance=10_000.0)
     shield = RiskShield(clock=_frozen_clock(T0))
     # No mark price set: paper adapter will reject.
     adapter = PaperAdapter(initial_balance=10_000.0)
@@ -569,7 +566,6 @@ def test_adapter_rejection_surfaces_in_pipeline_result() -> None:
     pipeline = SignalPipeline(
         FixedSignalStrategy(_buy_signal()),
         shield,
-        engine=StubEngine(portfolio=portfolio),
         adapter=adapter,
     )
 
@@ -630,43 +626,173 @@ def test_adapter_refresh_failure_fails_closed() -> None:
     assert shield.audit_log() == []
 
 
-def test_adapter_state_overrides_stale_engine_portfolio() -> None:
-    """When both an engine and an adapter are supplied, the adapter
-    is the execution backend AND the portfolio source. The legacy
-    engine's Portfolio could be stale (it never sees adapter
-    fills), so using it for the risk snapshot would approve
-    orders the actual exposure should block.
+def test_client_order_id_distinguishes_different_symbols() -> None:
+    """A naive `replace("/", "")` would let AB/CD and A/BCD collide;
+    the new hashed id MUST distinguish them.
     """
-    from engine.adapters import PaperAdapter
+    from engine.signal_pipeline import SignalPipeline as SP
 
-    # Legacy engine reports a fat 100k balance.
-    portfolio = Portfolio(initial_balance=100_000.0)
-    engine = StubEngine(portfolio=portfolio)
-    # Adapter reports a much smaller 1k balance - the real exposure.
-    adapter = PaperAdapter(initial_balance=1_000.0)
-    adapter.set_mark_price("BTC/USDT", 50_000.0)
-
-    shield = RiskShield(
-        config=RiskConfig(max_position_size_pct=0.20),
-        clock=_frozen_clock(T0),
+    sig1 = TradingSignal(
+        symbol="AB/CD", action="BUY", confidence=0.5, strategy="t",
+        timestamp=1_700_000_000.0,
     )
-    # Risk per trade tuned so the proposed notional would EASILY
-    # fit inside 20% of the engine's 100k (= 20k cap) but is
-    # OUT OF BOUNDS at 20% of the adapter's 1k (= 200 cap).
+    sig2 = TradingSignal(
+        symbol="A/BCD", action="BUY", confidence=0.5, strategy="t",
+        timestamp=1_700_000_000.0,
+    )
+    assert SP._client_order_id(sig1) != SP._client_order_id(sig2)
+
+
+def test_client_order_id_distinguishes_sub_millisecond_signals() -> None:
+    """Two signals one microsecond apart must produce different
+    ids; the prior millisecond truncation collapsed them.
+    """
+    from engine.signal_pipeline import SignalPipeline as SP
+
+    a = TradingSignal(
+        symbol="BTC/USDT", action="BUY", confidence=0.5, strategy="t",
+        timestamp=1_700_000_000.000001,
+    )
+    b = TradingSignal(
+        symbol="BTC/USDT", action="BUY", confidence=0.5, strategy="t",
+        timestamp=1_700_000_000.000002,
+    )
+    assert SP._client_order_id(a) != SP._client_order_id(b)
+
+
+def test_client_order_id_is_stable_for_identical_signal() -> None:
+    """Same logical signal must produce the same id every time so
+    the adapter's idempotency cache works."""
+    from engine.signal_pipeline import SignalPipeline as SP
+
+    a = TradingSignal(
+        symbol="BTC/USDT", action="BUY", confidence=0.5, strategy="t",
+        timestamp=1_700_000_000.0,
+    )
+    b = TradingSignal(
+        symbol="BTC/USDT", action="BUY", confidence=0.5, strategy="t",
+        timestamp=1_700_000_000.0,
+    )
+    assert SP._client_order_id(a) == SP._client_order_id(b)
+
+
+def test_adapter_request_preserves_signal_metadata() -> None:
+    """Strategy-emitted metadata (EVM token addresses, MT5
+    overrides, etc.) must reach adapter.place_order, not be
+    silently dropped. Without this, EVM swaps are rejected for
+    missing from_address/to_address.
+    """
+    from engine.adapters import (
+        ExecutionAdapter,
+        OrderRequest,
+        OrderResult,
+        OrderStatus,
+    )
+
+    captured: Dict[str, OrderRequest] = {}
+
+    class _CapturingAdapter(ExecutionAdapter):
+        name = "capture"
+
+        async def place_order(self, request: OrderRequest) -> OrderResult:
+            captured["request"] = request
+            return OrderResult(
+                client_order_id=request.client_order_id,
+                venue_order_id="v",
+                symbol=request.symbol,
+                side=request.side,
+                order_type=request.order_type,
+                status=OrderStatus.PENDING,
+            )
+
+        async def cancel_order(self, client_order_id: str) -> OrderResult:
+            raise AssertionError
+
+        async def get_open_orders(self):
+            return []
+
+        async def get_positions(self):
+            return {}
+
+        async def get_balance(self):
+            return 10_000.0
+
+    # Signal carries metadata the adapter MUST see.
+    sig = TradingSignal(
+        symbol="WETH/USDC",
+        action="SELL",
+        confidence=0.8,
+        strategy="evm-test",
+        entry_price=2000.0,
+        stop_loss=1900.0,
+        take_profit=2200.0,
+        metadata={
+            "from_address": "0xWETH...",
+            "to_address": "0xUSDC...",
+            "expected_amount_out": 2000.0,
+        },
+    )
+    pipeline = SignalPipeline(
+        FixedSignalStrategy(sig),
+        RiskShield(clock=_frozen_clock(T0)),
+        adapter=_CapturingAdapter(),
+    )
+    result = _run(pipeline.run_once(pd.DataFrame()))
+    assert result.executed is True
+    sent = captured["request"]
+    assert sent.metadata["from_address"] == "0xWETH..."
+    assert sent.metadata["to_address"] == "0xUSDC..."
+    assert sent.metadata["expected_amount_out"] == 2000.0
+    # Pipeline also stamps its own observability field.
+    assert "signal_timestamp" in sent.metadata
+
+
+def test_cancelled_adapter_result_does_not_count_as_success() -> None:
+    """An adapter that returns CANCELLED (venue refused or cancelled
+    mid-flight) must show up as execution.success=False so
+    downstream metrics do not over-count wins.
+    """
+    from engine.adapters import (
+        ExecutionAdapter,
+        OrderRequest,
+        OrderResult,
+        OrderStatus,
+    )
+
+    class _CancellingAdapter(ExecutionAdapter):
+        name = "canceller"
+
+        async def place_order(self, request: OrderRequest) -> OrderResult:
+            return OrderResult(
+                client_order_id=request.client_order_id,
+                venue_order_id="v",
+                symbol=request.symbol,
+                side=request.side,
+                order_type=request.order_type,
+                status=OrderStatus.CANCELLED,
+            )
+
+        async def cancel_order(self, client_order_id: str) -> OrderResult:
+            raise AssertionError
+
+        async def get_open_orders(self):
+            return []
+
+        async def get_positions(self):
+            return {}
+
+        async def get_balance(self):
+            return 10_000.0
+
     pipeline = SignalPipeline(
         FixedSignalStrategy(_buy_signal()),
-        shield,
-        engine=engine,
-        adapter=adapter,
-        config=PipelineConfig(risk_per_trade_pct=0.05, fallback_stop_pct=0.02),
+        RiskShield(clock=_frozen_clock(T0)),
+        adapter=_CancellingAdapter(),
     )
-
     result = _run(pipeline.run_once(pd.DataFrame()))
-    # Expectation: position-size rule rejects because we now size
-    # against the adapter's real 1k balance, not the engine's
-    # phantom 100k.
-    assert result.executed is False
-    assert result.risk_decision.reason == RejectionReason.POSITION_SIZE_EXCEEDED
+    assert result.executed is True
+    assert result.execution["status"] == "CANCELLED"
+    assert result.execution["success"] is False
 
 
 def test_drawdown_trip_via_pipeline_flow() -> None:
