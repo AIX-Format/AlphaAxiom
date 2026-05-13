@@ -664,6 +664,74 @@ def test_get_open_orders_uses_lock_for_consistent_snapshot() -> None:
     _run(scenario())
 
 
+def test_get_balance_returns_configured_account_equity() -> None:
+    """Pipeline reads adapter.get_balance() as equity; the MT5
+    adapter must therefore return a usable value, not 0.0.
+    """
+    async def scenario() -> None:
+        adapter = MT5Adapter(
+            http_client=_FakeHttp([]),
+            signer=_signer(),
+            account_equity=25_000.0,
+            positions={"EURUSD": 0.5, "GBPUSD": -0.25},
+        )
+        assert (await adapter.get_balance()) == pytest.approx(25_000.0)
+        positions = await adapter.get_positions()
+        assert positions == {"EURUSD": 0.5, "GBPUSD": -0.25}
+
+    _run(scenario())
+
+
+def test_set_account_equity_updates_balance_and_rejects_garbage() -> None:
+    adapter = MT5Adapter(http_client=_FakeHttp([]), signer=_signer())
+    adapter.set_account_equity(12_345.67)
+    assert _run(adapter.get_balance()) == pytest.approx(12_345.67)
+    with pytest.raises(AdapterError):
+        adapter.set_account_equity(float("nan"))
+    with pytest.raises(AdapterError):
+        adapter.set_account_equity(-1.0)
+
+
+def test_request_metadata_is_forwarded_in_signed_payload() -> None:
+    """Strategies set MT5-specific overrides (instrument hints,
+    routing flags) in OrderRequest.metadata. The adapter must
+    serialise them into the signed envelope so the relay and the
+    MQL EA can read them.
+    """
+    async def scenario() -> None:
+        http = _FakeHttp([
+            HttpResponse(status=202, body=b'{"venue_order_id":"v"}', headers={})
+        ])
+        adapter = MT5Adapter(http_client=http, signer=_signer())
+        req = _request("ord-meta")
+        # Replace the default metadata with the routing hints the
+        # strategy emitted.
+        req = OrderRequest(
+            client_order_id=req.client_order_id,
+            symbol=req.symbol,
+            side=req.side,
+            order_type=req.order_type,
+            notional=req.notional,
+            strategy=req.strategy,
+            metadata={
+                "mt5_instrument": "EURUSD.r",
+                "comment": "scalp-v1",
+                "magic_number": 42,
+            },
+        )
+        await adapter.place_order(req)
+        _, _, _, body = http.calls[0]
+        envelope = json.loads(body)
+        meta = envelope["payload"].get("metadata")
+        assert meta == {
+            "mt5_instrument": "EURUSD.r",
+            "comment": "scalp-v1",
+            "magic_number": 42,
+        }
+
+    _run(scenario())
+
+
 def test_keychain_signer_raises_when_key_missing(monkeypatch) -> None:
     from engine.adapters import mt5 as mt5_module
 

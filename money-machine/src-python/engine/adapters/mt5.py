@@ -198,12 +198,26 @@ class MT5Adapter(ExecutionAdapter):
         config: Optional[MT5Config] = None,
         public_key_id: str = "default",
         clock: Callable[[], datetime] = lambda: datetime.now(tz=timezone.utc),
+        account_equity: Optional[float] = None,
+        positions: Optional[Dict[str, float]] = None,
     ) -> None:
         self.http = http_client
         self.signer = signer
         self.config = config or MT5Config()
         self.public_key_id = public_key_id
         self.clock = clock
+        # MT5 holds the source-of-truth balance on the terminal side;
+        # there is no live poll path yet. We accept an externally
+        # supplied equity at construction time and expose
+        # `set_account_equity` so a future MT5 poll service (or
+        # an operator-managed config) can keep the value current.
+        # Without this the SignalPipeline now reads
+        # `adapter.get_balance()` as the equity for risk sizing and
+        # would short-circuit every order with equity == 0.
+        self._account_equity = (
+            float(account_equity) if account_equity is not None else 0.0
+        )
+        self._positions: Dict[str, float] = dict(positions or {})
         # Idempotency cache: client_order_id -> last definitive result.
         # Anything PENDING is also cached so a retry sees the same
         # response without re-signing.
@@ -544,22 +558,74 @@ class MT5Adapter(ExecutionAdapter):
             return [r for r in self._order_cache.values() if r.is_open]
 
     async def get_positions(self) -> Dict[str, float]:
-        # The Worker holds the source of truth for MT5 positions and
-        # is queried via a separate poll path (next PR). For now we
-        # report no positions tracked locally.
-        return {}
+        """Last known MT5 position snapshot.
+
+        Default-empty until the caller wires up `set_positions` from
+        an MT5 poll service. Returning {} here is safe even with the
+        new pipeline contract because the risk shield's
+        max_concurrent_positions rule then operates on a known-zero
+        snapshot; the operator must set positions for the rule to
+        be enforced against real MT5 exposure.
+        """
+        async with self._lock:
+            return dict(self._positions)
 
     async def get_balance(self) -> float:
-        # Same as get_positions: MT5 balance lives on the terminal
-        # side and is not yet polled.
-        return 0.0
+        """Last known MT5 account equity.
+
+        Returns the value supplied at construction or set via
+        `set_account_equity`. The previous 0.0 hardcoded return
+        blocked every order routed through the SignalPipeline
+        because the pipeline now sources equity from
+        `adapter.get_balance()`; with equity <= 0 the risk shield
+        rejects the order as INVALID_PORTFOLIO_STATE before any
+        relay POST happens.
+        """
+        async with self._lock:
+            return float(self._account_equity)
+
+    def set_account_equity(self, value: float) -> None:
+        """Update the MT5 account equity used by the pipeline for
+        sizing and risk checks. Reject NaN/inf and negative values
+        explicitly; those would silently corrupt downstream math.
+        """
+        try:
+            v = float(value)
+        except (TypeError, ValueError) as exc:
+            raise AdapterError(
+                f"account_equity must be numeric, got {value!r}"
+            ) from exc
+        import math
+
+        if not math.isfinite(v) or v < 0:
+            raise AdapterError(
+                f"account_equity must be finite and >= 0, got {value!r}"
+            )
+        self._account_equity = v
+
+    def set_positions(self, positions: Dict[str, float]) -> None:
+        """Update the cached MT5 position snapshot."""
+        if not isinstance(positions, dict):
+            raise AdapterError(
+                f"positions must be a dict, got {type(positions).__name__}"
+            )
+        self._positions = dict(positions)
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
     def _build_payload(self, request: OrderRequest) -> Dict[str, Any]:
-        """Construct the signal payload exactly as the Worker expects."""
+        """Construct the signal payload exactly as the Worker expects.
+
+        Forwards `request.metadata` under a nested `metadata` key so
+        MT5-specific overrides (instrument code, account hint,
+        routing flags, comments) survive the trip through the
+        pipeline. We do NOT flatten them into top-level fields to
+        avoid colliding with the canonical keys above; the Worker
+        and the MQL EA agree on `metadata.*` as the namespace for
+        anything venue-specific.
+        """
         payload: Dict[str, Any] = {
             "client_order_id": request.client_order_id,
             "symbol": request.symbol,
@@ -578,6 +644,11 @@ class MT5Adapter(ExecutionAdapter):
             payload["stop_loss"] = float(request.stop_loss)
         if request.take_profit is not None:
             payload["take_profit"] = float(request.take_profit)
+        if request.metadata:
+            # Only serialise JSON-friendly values. Caller is
+            # responsible for keeping metadata small (the canonical
+            # form is signed, so big blobs slow signing too).
+            payload["metadata"] = _stringify_metadata(request.metadata)
         return payload
 
     async def _post_with_retries(
@@ -665,6 +736,24 @@ class MT5Adapter(ExecutionAdapter):
             status=OrderStatus.REJECTED,
             error=error,
         )
+
+
+def _stringify_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """Filter metadata to JSON-serialisable scalars and short
+    collections. Anything that does not round-trip through
+    `json.dumps` is stringified so signing cannot fail on weird
+    types the caller stuffed into the dict.
+    """
+    out: Dict[str, Any] = {}
+    for key, value in metadata.items():
+        if not isinstance(key, str):
+            key = str(key)
+        try:
+            json.dumps(value)
+            out[key] = value
+        except (TypeError, ValueError):
+            out[key] = str(value)
+    return out
 
 
 def _safe_parse_json_dict(body: bytes) -> Dict[str, Any]:
