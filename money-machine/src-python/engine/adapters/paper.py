@@ -79,11 +79,17 @@ class PaperAdapter(ExecutionAdapter):
     # ------------------------------------------------------------------
 
     def set_mark_price(self, symbol: str, price: float) -> None:
-        """Update the mark used for fills on `symbol`.
-
-        Rejects non-finite values (NaN/inf) explicitly: those would
-        propagate straight into quantity/notional math on the next
-        fill and silently corrupt balance and positions.
+        """
+        Update the mark price used for fills for the given symbol.
+        
+        Converts `price` to float and validates it is finite and greater than zero before storing it.
+        
+        Parameters:
+            symbol (str): Symbol whose mark price will be set.
+            price (float): New mark price (will be converted to float).
+        
+        Raises:
+            AdapterError: If `price` is not convertible to float, is not finite, or is not greater than zero.
         """
         try:
             value = float(price)
@@ -98,17 +104,16 @@ class PaperAdapter(ExecutionAdapter):
         self._mark_prices[symbol] = value
 
     def reset(self, *, initial_balance: Optional[float] = None) -> None:
-        """Wipe order history, positions, and balance back to a
-        clean state. Mark prices and the configured cost models
-        are preserved.
-
-        Used by short-lived simulations (RL training, walk-forward
-        sweeps) that need a fresh adapter at the top of every
-        episode without paying the cost of re-instantiation. The
-        public method replaces the previous pattern of poking at
-        the underscore-prefixed attributes from outside, which
-        broke encapsulation and made the adapter fragile to
-        bookkeeping changes.
+        """
+        Reset the adapter's in-memory trading state while preserving mark prices and configured cost models.
+        
+        If `initial_balance` is provided, set the adapter balance to that value (must be >= 0). In all cases clear positions, order history, and open orders so the adapter is returned to a fresh, empty trading state; mark prices and the configured commission/slippage models are left unchanged.
+        
+        Parameters:
+            initial_balance (Optional[float]): If provided, the new starting cash balance.
+        
+        Raises:
+            AdapterError: If `initial_balance` is provided and is less than 0.
         """
         if initial_balance is not None:
             if initial_balance < 0:
@@ -121,17 +126,19 @@ class PaperAdapter(ExecutionAdapter):
         self._open_orders.clear()
 
     def place_order_sync(self, request: OrderRequest) -> OrderResult:
-        """Synchronous market-order entry point for non-async hosts.
-
-        Provides the same fill logic as `place_order` without the
-        asyncio lock and without scheduling on the event loop.
-        Designed for tight loops (RL env step, vectorised
-        backtests) that would otherwise spin up a fresh event loop
-        on every call via `asyncio.run`.
-
-        Limitations: limit orders that would park as PENDING are
-        rejected here (PENDING management requires the lock and
-        process_open_orders to clear; use the async path instead).
+        """
+        Place an order synchronously against the in-memory paper simulator for non-async callers.
+        
+        Performs idempotent validation and execution using current mark prices without acquiring the adapter's asyncio lock. Behavior:
+        - If a result for request.client_order_id exists, returns the cached result.
+        - Validates the request and rejects (and caches) invalid requests.
+        - Requires a mark price for the request.symbol; otherwise rejects (and caches).
+        - MARKET orders are filled immediately using the same fill logic as the async path.
+        - LIMIT orders are filled if immediately fillable; otherwise they are rejected here (this sync path does not park PENDING orders — use the async place_order + process_open_orders for pending management).
+        - Final result is cached in _order_history and returned. Fills will update balance and positions as in the async flow.
+        
+        Returns:
+            OrderResult: The resulting order outcome (FILLED, REJECTED, or PENDING is not produced by this sync path).
         """
         cached = self._order_history.get(request.client_order_id)
         if cached is not None:
@@ -167,11 +174,13 @@ class PaperAdapter(ExecutionAdapter):
         return result
 
     async def process_open_orders(self) -> List[OrderResult]:
-        """Re-evaluate every PENDING limit order against current marks.
-
-        Returns the orders that newly filled. Pending orders that
-        still cannot fill are left in place. Call this after each
-        `set_mark_price` if you want LIMIT orders to clear.
+        """
+        Re-evaluate all pending LIMIT orders against current mark prices and return those that were filled.
+        
+        Pending LIMIT orders whose conditions are still not met remain open; orders without a known mark price are skipped.
+        
+        Returns:
+            newly_filled (List[OrderResult]): List of OrderResult objects for orders that were filled during this call.
         """
         newly_filled: List[OrderResult] = []
         async with self._lock:

@@ -57,6 +57,21 @@ from engine.rl.reward import (  # noqa: E402
 
 
 def _build_df(closes: List[float], *, atr_pct: float = 0.005) -> pd.DataFrame:
+    """
+    Create an OHLCV pandas DataFrame from a sequence of close prices with an hourly UTC index.
+    
+    Parameters:
+        closes (List[float]): Sequence of close prices; length determines number of rows.
+        atr_pct (float): Fraction of the price midpoint used to expand high/low around the open/close midpoint.
+    
+    Returns:
+        pd.DataFrame: DataFrame indexed by hourly UTC timestamps with columns:
+            - `open`: previous close (first open equals first close)
+            - `high`: max(open, close) plus `atr_pct` of the midpoint
+            - `low`: min(open, close) minus `atr_pct` of the midpoint
+            - `close`: provided close prices
+            - `volume`: constant 100.0 for all rows
+    """
     n = len(closes)
     idx = pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC")
     opens = [closes[0]] + closes[:-1]
@@ -87,6 +102,20 @@ def _build_env(
     window_size: int = 16,
     warmup_bars: int = 20,
 ) -> TradingEnv:
+    """
+    Builds a TradingEnv configured from synthetic OHLCV data derived from the provided close prices.
+    
+    Parameters:
+        closes (List[float]): Sequence of close prices used to synthesize an OHLCV DataFrame.
+        initial_equity (float): Starting account equity for the environment.
+        position_fraction (float): Fraction of equity used for target position sizing on filled orders.
+        allow_short (bool): Whether the environment permits opening short positions.
+        window_size (int): Number of past bars included in the observation window.
+        warmup_bars (int): Number of initial bars used to warm up indicators before stepping.
+    
+    Returns:
+        TradingEnv: A TradingEnv instance constructed with the synthesized data, a paper trading adapter, and the specified configuration.
+    """
     df = _build_df(closes)
     adapter = PaperAdapter(
         initial_balance=initial_equity,
@@ -171,6 +200,11 @@ def test_turnover_penalty_charges_direction_flip_only() -> None:
 
 
 def test_sharpe_reward_smooths_over_window() -> None:
+    """
+    Validates that SharpeRatioReward smooths returns over its window and handles zero variance safely.
+    
+    Asserts that a constant return stream yields a zero reward (safety branch for zero variance), and that a sequence with non-zero variance produces a finite, strictly positive Sharpe reward.
+    """
     r = SharpeRatioReward(window=10, scale=1.0)
     # Feed a stable 1% return stream; Sharpe should be a finite,
     # large positive number after a few steps.
@@ -222,6 +256,12 @@ def test_composite_safe_coerces_each_component_independently() -> None:
     """
 
     def bad_component(**kwargs: object) -> float:
+        """
+        Return a NaN-valued reward component.
+        
+        Returns:
+            float: A `NaN` value indicating an invalid or non-finite component.
+        """
         return float("nan")
 
     fn = composite(
@@ -301,10 +341,10 @@ def test_env_blocks_short_when_disallowed() -> None:
 
 
 def test_sell_with_slippage_does_not_open_short_when_disallowed() -> None:
-    """Pre-cap notional + post-fill clamp: a SELL with nonzero
-    slippage might fill at a worse price and end up reducing the
-    position by MORE than the long. The post-fill clamp must keep
-    the position at exactly 0 in that case.
+    """
+    Ensure a SELL action with nonzero slippage cannot create a short position when shorting is disabled.
+    
+    This test opens a long position and issues repeated SELL actions while using a PaperAdapter configured with significant fixed slippage. It asserts the environment clamps any slippage-induced overshoot so the resulting position never becomes negative (tolerating tiny numerical noise by allowing positions >= -1e-9).
     """
     df = _build_df([100.0 + i * 0.1 for i in range(40)])
     adapter = PaperAdapter(
@@ -415,8 +455,10 @@ def test_env_invalid_action_raises() -> None:
 
 
 def test_env_rejects_non_integer_action() -> None:
-    """Float actions must NOT be silently coerced via int(). A policy
-    bug that produces 1.9 should fail fast, not execute BUY.
+    """
+    Verify that env.step rejects non-integer action inputs and raises ValueError.
+    
+    Asserts that a float action (e.g., 1.9) is not silently coerced to an int and that non-integer types (e.g., the string "BUY") raise ValueError.
     """
     env = _build_env(closes=[100.0 + i for i in range(40)])
     env.reset()
@@ -427,15 +469,22 @@ def test_env_rejects_non_integer_action() -> None:
 
 
 def test_env_config_seed_used_when_reset_seed_omitted() -> None:
-    """Two envs with the same EnvConfig.seed should produce
-    identical observation sequences from reset() (no explicit
-    seed argument). The previous code only honoured the method
-    argument, making the config knob a no-op for the typical
-    `env.reset()` call pattern.
+    """
+    Verifies that two environments constructed with the same EnvConfig.seed produce identical observations when reset() is called without an explicit seed.
+    
+    Asserts the observations returned by env.reset() for both environments are elementwise close using numpy's testing utilities.
     """
     df = _build_df([100.0 + 0.5 * i for i in range(60)])
 
     def fresh_env() -> TradingEnv:
+        """
+        Create a TradingEnv configured with a default PaperAdapter and EnvConfig using the module-level `df`.
+        
+        The environment uses a PaperAdapter with 10,000 initial balance, zero commission, and zero slippage, and an EnvConfig for symbol "BTC/USDT", initial equity 10,000, warmup bars 20, seed 42, and an ObservationConfig with window_size 8.
+        
+        Returns:
+            TradingEnv: A ready-to-use TradingEnv built from `df` with the defaults described above.
+        """
         adapter = PaperAdapter(
             initial_balance=10_000.0,
             commission=FlatCommission(rate=0.0),
@@ -479,16 +528,26 @@ def test_env_rejects_too_short_data() -> None:
 
 
 def test_env_runs_inside_running_event_loop() -> None:
-    """The env must not call `asyncio.run` per step; otherwise it
-    blows up when used inside a running event loop (RLlib worker,
-    Jupyter, async test harness). Drive a few steps from inside an
-    async function and confirm no `RuntimeError` is raised.
+    """
+    Ensure the environment does not call asyncio.run from inside an active event loop.
+    
+    Runs reset() and several step() calls within an asyncio event loop and asserts that no RuntimeError is raised and the environment's cumulative step counter increments as expected.
     """
     import asyncio
 
     env = _build_env(closes=[100.0 + i for i in range(40)], window_size=8, warmup_bars=20)
 
     async def drive() -> int:
+        """
+        Advance the environment through five predefined actions while running inside an active event loop.
+        
+        Executes a reset of the shared `env` and performs the action sequence
+        [ACTION_BUY, ACTION_HOLD, ACTION_SELL, ACTION_HOLD, ACTION_BUY] by calling
+        `env.step(...)` for each action.
+        
+        Returns:
+            int: The environment's cumulative step count after performing the actions.
+        """
         env.reset()
         # 5 alternating actions inside an active event loop.
         for action in [ACTION_BUY, ACTION_HOLD, ACTION_SELL, ACTION_HOLD, ACTION_BUY]:
@@ -514,6 +573,15 @@ def test_indicators_are_precomputed_once() -> None:
     original = env_module.rsi
 
     def counting(*args, **kwargs):
+        """
+        Increment a shared call counter and invoke the wrapped callable with the provided arguments.
+        
+        Increments call_count[0] as a side effect, then forwards all positional and keyword
+        arguments to the original callable and returns its result.
+        
+        Returns:
+            The value returned by the wrapped callable.
+        """
         call_count[0] += 1
         return original(*args, **kwargs)
 
@@ -530,10 +598,10 @@ def test_indicators_are_precomputed_once() -> None:
 
 
 def test_position_observation_is_scale_invariant_weight() -> None:
-    """Position in the observation must be `(position * price) /
-    equity`, not the raw quantity. A BTC long of 0.1 at price 50k
-    on a 10k equity should show position weight ≈ 0.5; a SHIB long
-    of 5e7 at price 1e-5 on the same equity should also show ≈ 0.5.
+    """
+    Assert that the position feature in the observation is the position-value fraction (position * price) / equity rather than raw quantity.
+    
+    The test opens equivalent fractional positions in a high-priced asset (BTC-like) and a low-priced asset (SHIB-like) and checks that the position-weight observation for both is approximately 0.5 (50% of equity).
     """
     # BTC-like asset: high price, small position size.
     closes_btc = [50_000.0] * 40
@@ -585,9 +653,8 @@ def test_paper_adapter_reset_clears_state() -> None:
 
 
 def test_env_passes_gymnasium_env_checker() -> None:
-    """The official Gymnasium env_checker runs reset/step/close,
-    verifies space shapes, dtypes, and seeding behaviour. If
-    anything in the contract drifts this test catches it.
+    """
+    Check that the TradingEnv implementation complies with Gymnasium's API contract by running gymnasium.utils.env_checker.check_env.
     """
     from gymnasium.utils.env_checker import check_env
 

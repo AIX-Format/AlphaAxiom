@@ -127,6 +127,23 @@ class TradingEnv(gym.Env):
         config: Optional[EnvConfig] = None,
         reward: Optional[RewardFunction] = None,
     ) -> None:
+        """
+        Create a TradingEnv configured to step bar-by-bar over the provided OHLCV DataFrame.
+        
+        Parameters:
+            data (pd.DataFrame): OHLCV timeseries with columns including 'open', 'high', 'low', 'close', 'volume'.
+            adapter (PaperAdapter): Execution adapter used to place orders and track balances.
+            config (Optional[EnvConfig]): Environment configuration; defaults to EnvConfig() when omitted.
+            reward (Optional[RewardFunction]): Reward function to score steps; defaults to a PnL-as-return reward.
+        
+        The constructor validates the input data and warmup length, precomputes indicator series, initializes numpy views
+        for open/close prices, sets Gym action and observation spaces, and initializes mutable episode state (current bar,
+        equity, peak equity, position, and step counters).
+        
+        Raises:
+            ValueError: if `data` is invalid or too short for the configured warmup, or if `config.warmup_bars` is smaller
+                        than `config.observation.window_size`.
+        """
         super().__init__()
         self.config = config or EnvConfig()
         self._validate_data(data)
@@ -189,6 +206,21 @@ class TradingEnv(gym.Env):
         # at construction time via the config and then call
         # `env.reset()` without arguments; without this fallback
         # the config knob is silently ignored.
+        """
+        Reset the environment to start a new episode and return the initial observation and auxiliary info.
+        
+        Parameters:
+            seed (Optional[int]): If provided, used as the environment seed; if `None`, uses `config.seed`.
+            options (Optional[Dict[str, Any]]): Reserved for Gym-compatible options (unused).
+        
+        Returns:
+            Tuple[np.ndarray, Dict[str, Any]]: 
+                The initial observation array and an `info` dictionary containing keys:
+                - `"step"`: 0
+                - `"equity"`: current equity after reset
+                - `"position"`: current position after reset
+                - `"bar_index"`: index of the current bar (starting at `warmup_bars`)
+        """
         effective_seed = self.config.seed if seed is None else seed
         super().reset(seed=effective_seed)
         self._current_bar = self.config.warmup_bars
@@ -218,6 +250,22 @@ class TradingEnv(gym.Env):
         # Use the Gymnasium space's own `contains` predicate so
         # non-integer inputs (e.g. 1.9) are rejected instead of
         # being silently coerced to a valid action via `int()`.
+        """
+        Advance the environment one bar by executing the given discrete action and produce the next observation, scalar reward, termination/truncation flags, and step info.
+        
+        The action is validated against the environment's action space, converted into a market order that is executed at the next bar's open, then the environment clock is advanced and equity is marked to the next bar's close. Reward is computed from the configured reward function. The episode terminates if equity falls below the configured minimum fraction of initial equity or when the dataset is exhausted.
+        
+        Parameters:
+            action (int): Discrete action index (0 = HOLD, 1 = BUY, 2 = SELL).
+        
+        Returns:
+            Tuple containing:
+            - observation (np.ndarray): next clipped observation vector built for the new current bar.
+            - reward (float): scalar reward computed for this step.
+            - terminated (bool): `True` if the episode ended due to equity falling below the minimum threshold.
+            - truncated (bool): `True` if the episode ended due to reaching the final bar.
+            - info (dict): diagnostic information including keys: `step`, `equity`, `position`, `bar_index`, `prev_peak_equity`, `new_peak_equity`, `step_return`, and `fill` (order/fill summary).
+        """
         if not self.action_space.contains(action):
             raise ValueError(
                 f"action must be a member of {self.action_space!r}, got {action!r}"
@@ -283,12 +331,22 @@ class TradingEnv(gym.Env):
         return obs, reward, bool(terminated), bool(truncated), info
 
     def render(self) -> None:  # pragma: no cover - cosmetic
+        """
+        Log the current environment state (bar index, equity, position, and peak equity) for human inspection.
+        
+        This is a cosmetic render method that emits an informational log entry containing the environment's current bar index, equity, position, and peak equity.
+        """
         logger.info(
             "bar=%d equity=%.2f position=%.6f peak=%.2f",
             self._current_bar, self._equity, self._position, self._peak_equity,
         )
 
     def close(self) -> None:  # pragma: no cover
+        """
+        Close the environment and release any held resources.
+        
+        This method is provided for Gymnasium compatibility; in the current implementation it performs no action.
+        """
         return None
 
     # ------------------------------------------------------------------
@@ -296,11 +354,17 @@ class TradingEnv(gym.Env):
     # ------------------------------------------------------------------
 
     def _precompute_indicators(self) -> Dict[str, np.ndarray]:
-        """Run RSI/EMA/ATR once over the full historical series.
-
-        Each indicator returns a Series aligned to the input index;
-        we drop them straight to numpy arrays so `_build_observation`
-        is a constant-time lookup.
+        """
+        Compute RSI, EMA, and ATR once over the entire input series and cache them as numpy arrays.
+        
+        The returned arrays are aligned to the environment's DataFrame index and use dtype float64 for O(1)
+        per-bar lookups in observation construction.
+        
+        Returns:
+            dict: Mapping of indicator name to numpy array:
+                - 'rsi': RSI( period=observation.rsi_period ) as float64 array
+                - 'ema': EMA( period=observation.ema_period ) as float64 array
+                - 'atr': ATR( period=observation.atr_period ) as float64 array
         """
         cfg = self.config.observation
         close = self._data["close"]
@@ -316,6 +380,14 @@ class TradingEnv(gym.Env):
         }
 
     def _build_observation(self) -> np.ndarray:
+        """
+        Builds the environment observation for the current bar.
+        
+        Constructs a vector composed of a rolling window of closes normalized to the latest close, followed by five scalars: RSI/100, EMA relative to the latest close minus one, ATR divided by the latest close, position weight (position * mark / equity) and equity normalized to the initial equity minus one. The rolling window is left-padded with the earliest available close when the window is incomplete; indicator fallbacks are used when values are missing or invalid. The resulting observation is clipped to the range [-10.0, 10.0].
+        
+        Returns:
+            np.ndarray: 1-D observation array of length `window_size + 5` with dtype float32.
+        """
         cfg = self.config.observation
         end = self._current_bar + 1
         start = max(0, end - cfg.window_size)
@@ -358,6 +430,17 @@ class TradingEnv(gym.Env):
 
     @staticmethod
     def _safe_indicator(arr: np.ndarray, bar: int, *, fallback: float) -> float:
+        """
+        Safely retrieve an indicator value for a specific bar index, returning a fallback when the value is missing, NaN, infinite, or the index is out of range.
+        
+        Parameters:
+            arr (np.ndarray): 1-D array of indicator values aligned to bar indices.
+            bar (int): Bar index to read from `arr`.
+            fallback (float): Value to return if the requested entry is invalid or unavailable.
+        
+        Returns:
+            float: The finite indicator value at `bar`, or `fallback` when the value is out of range or not a finite number.
+        """
         if 0 <= bar < arr.shape[0]:
             value = arr[bar]
             if not math.isnan(value) and not math.isinf(value):
@@ -367,10 +450,22 @@ class TradingEnv(gym.Env):
     def _apply_action(
         self, action: int, *, notional: float, mark: float
     ) -> Dict[str, Any]:
-        """Translate the discrete action into a paper order.
-
-        Returns a small dict with the fill summary so the reward
-        function can inspect it via `info["fill"]`.
+        """
+        Convert a discrete action (HOLD/BUY/SELL) into a market OrderRequest executed synchronously by the paper adapter and update the environment's position based on the fill.
+        
+        Parameters:
+            action (int): Discrete action id (ACTION_HOLD, ACTION_BUY, ACTION_SELL).
+            notional (float): Dollar notional to use for the order; used to size the market order.
+            mark (float): Current market price used for notional capping and as a fallback fill price.
+        
+        Returns:
+            dict: A minimal fill summary for inclusion in the step `info`. Possible shapes include:
+                - {"status": "HOLD"} when no order is placed.
+                - {"status": "BLOCKED_SHORT_DISABLED"} when a SELL would open a short but shorts are disabled.
+                - {"status": result_status_value, "error": ...} when the adapter did not fill the order.
+                - {"status": "FILLED", "fill_price": float, "quantity": float} for a normal filled order.
+                - {"status": "FILLED", "fill_price": float, "quantity": float, "short_overshoot_clamped": float}
+                  when a SELL fill slightly exceeds the available long position and the overshoot is clamped to zero.
         """
         if action == ACTION_HOLD or notional <= 0 or mark <= 0:
             return {"status": "HOLD"}
@@ -435,16 +530,40 @@ class TradingEnv(gym.Env):
         return {"status": result.status.value, "error": result.error}
 
     def _position_value(self, price: float) -> float:
-        """Mark-to-market value of the current position at `price`."""
+        """
+        Mark-to-market value of the current position at the given price.
+        
+        Parameters:
+            price (float): Market price used to value the position.
+        
+        Returns:
+            float: Position value computed as position quantity multiplied by the price.
+        """
         return float(self._position) * float(price)
 
     def _set_mark(self, bar_idx: int) -> None:
+        """
+        Set the adapter's market mark price to the close price at the given bar index when that price is greater than zero.
+        
+        Parameters:
+            bar_idx (int): Index of the bar whose close price will be used to update the adapter mark.
+        """
         price = float(self._close_arr[bar_idx])
         if price > 0:
             self.adapter.set_mark_price(self.config.symbol, price)
 
     @staticmethod
     def _validate_data(data: pd.DataFrame) -> None:
+        """
+        Validate that `data` is a non-empty OHLCV DataFrame suitable for the trading environment.
+        
+        Parameters:
+            data (pd.DataFrame): Time-series DataFrame expected to contain OHLCV columns.
+        
+        Raises:
+            ValueError: If `data` is None or empty.
+            ValueError: If any required columns are missing; required columns are: "open", "high", "low", "close", "volume".
+        """
         if data is None or data.empty:
             raise ValueError("TradingEnv requires a non-empty OHLCV DataFrame")
         missing = [c for c in ("open", "high", "low", "close", "volume") if c not in data.columns]
