@@ -226,6 +226,27 @@ def test_list_entries_is_safe_without_password(tmp_path: Path) -> None:
         assert "password" not in summary
 
 
+def test_list_entries_skips_non_object_json_files(tmp_path: Path) -> None:
+    """A manually-edited *.json file containing a JSON array instead
+    of an object must not crash list_entries; the healthy entries
+    in the same directory should still be listed.
+    """
+    ks = Keystore(tmp_path)
+    entry = ks.store_key(
+        private_key=PRIVATE_KEY_32, password="pw",
+        label="healthy", chain="ethereum",
+    )
+    # Drop a sibling file that is valid JSON but not an object.
+    (tmp_path / "garbage.json").write_text("[1, 2, 3]")
+    # And one that is just a JSON string.
+    (tmp_path / "string.json").write_text('"not an envelope"')
+
+    listed = ks.list_entries()
+    assert len(listed) == 1
+    assert listed[0].id == entry.id
+    assert listed[0].label == "healthy"
+
+
 def test_delete_entry_removes_file(tmp_path: Path) -> None:
     ks = Keystore(tmp_path)
     entry = ks.store_key(

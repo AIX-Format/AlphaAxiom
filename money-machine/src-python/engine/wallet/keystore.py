@@ -244,6 +244,13 @@ class Keystore:
     def list_entries(self) -> List[KeystoreEntry]:
         """Return summaries of every entry. Reads files but does NOT
         decrypt; safe to expose to UI.
+
+        A *.json file that is syntactically valid but is not a JSON
+        object (e.g. an array left by a manual edit, a partial
+        write, or a corrupted envelope) is skipped silently with a
+        log line. Without this guard one malformed file would raise
+        AttributeError inside `envelope.get(...)` and the whole
+        listing would abort, hiding healthy entries from operators.
         """
         entries: List[KeystoreEntry] = []
         for path in sorted(self.directory.glob("*.json")):
@@ -251,6 +258,13 @@ class Keystore:
                 with open(path, "r", encoding="utf-8") as f:
                     envelope = json.load(f)
             except (OSError, ValueError):
+                continue
+            if not isinstance(envelope, dict):
+                logger.warning(
+                    "Skipping non-object keystore file %s (top-level "
+                    "is %s, not a dict)",
+                    path, type(envelope).__name__,
+                )
                 continue
             entries.append(
                 KeystoreEntry(
