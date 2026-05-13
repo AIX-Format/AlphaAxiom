@@ -353,6 +353,69 @@ def test_observation_config_rejects_zero_window() -> None:
         ObservationConfig(rsi_period=0)
 
 
+def test_env_rejects_non_int_warmup_bars() -> None:
+    """warmup_bars indexes numpy arrays during step; non-int input
+    must be rejected at construction, not at the first step."""
+    df = _build_df([100.0 + i * 0.1 for i in range(40)])
+    adapter = PaperAdapter(initial_balance=10_000.0)
+    for bad in (20.0, "20", True):
+        with pytest.raises(ValueError, match="warmup_bars"):
+            TradingEnv(
+                df, adapter,
+                EnvConfig(
+                    warmup_bars=bad,  # type: ignore[arg-type]
+                    observation=ObservationConfig(window_size=8),
+                ),
+            )
+
+
+def test_env_rejects_invalid_min_equity_fraction() -> None:
+    """NaN/inf for min_equity_fraction silently disables the
+    termination circuit breaker because `x < NaN` is always
+    False. Values outside [0, 1] make no economic sense."""
+    df = _build_df([100.0 + i * 0.1 for i in range(40)])
+    adapter = PaperAdapter(initial_balance=10_000.0)
+    for bad in (float("nan"), float("inf"), -0.01, 1.5):
+        with pytest.raises(ValueError, match="min_equity_fraction"):
+            TradingEnv(
+                df, adapter,
+                EnvConfig(
+                    min_equity_fraction=bad,
+                    warmup_bars=20,
+                    observation=ObservationConfig(window_size=8),
+                ),
+            )
+
+
+def test_env_rejects_invalid_position_fraction() -> None:
+    """position_fraction sizes every order. <= 0 turns every trade
+    into HOLD, > 1 over-leverages, NaN/inf bricks the order path."""
+    df = _build_df([100.0 + i * 0.1 for i in range(40)])
+    adapter = PaperAdapter(initial_balance=10_000.0)
+    for bad in (0.0, -0.1, 1.5, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="position_fraction"):
+            TradingEnv(
+                df, adapter,
+                EnvConfig(
+                    position_fraction=bad,
+                    warmup_bars=20,
+                    observation=ObservationConfig(window_size=8),
+                ),
+            )
+
+
+def test_paper_adapter_reset_rejects_non_finite_initial_balance() -> None:
+    """A NaN initial_balance would land in `_balance` and corrupt
+    every later cash comparison via NaN propagation."""
+    from engine.adapters import PaperAdapter
+    from engine.adapters.base import AdapterError as _AdapterError
+
+    adapter = PaperAdapter(initial_balance=10_000.0)
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(_AdapterError):
+            adapter.reset(initial_balance=bad)
+
+
 def test_env_rejects_non_positive_initial_equity() -> None:
     """`equity_norm = equity / initial_equity - 1` in the
     observation builder would explode on a 0 or non-finite

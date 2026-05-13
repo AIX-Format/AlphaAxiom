@@ -143,10 +143,20 @@ class PaperAdapter(ExecutionAdapter):
             AdapterError: If `initial_balance` is provided and
                 negative.
         """
-        if initial_balance is not None and initial_balance < 0:
-            raise AdapterError(
-                f"initial_balance must be >= 0, got {initial_balance!r}"
-            )
+        if initial_balance is not None:
+            try:
+                candidate = float(initial_balance)
+            except (TypeError, ValueError) as exc:
+                raise AdapterError(
+                    f"initial_balance must be numeric, got {initial_balance!r}"
+                ) from exc
+            import math
+
+            if not math.isfinite(candidate) or candidate < 0:
+                raise AdapterError(
+                    "initial_balance must be a finite non-negative "
+                    f"number, got {initial_balance!r}"
+                )
         with self._sync_lock:
             if initial_balance is not None:
                 self._balance = float(initial_balance)

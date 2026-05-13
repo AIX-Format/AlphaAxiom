@@ -170,6 +170,20 @@ class TradingEnv(gym.Env):
         self.adapter = adapter
         self.reward_fn: RewardFunction = reward or PnLReward(as_return=True)
 
+        # `warmup_bars` flows straight into `_current_bar` and is
+        # used as a numpy index in `_set_mark` / observation
+        # assembly. A non-int value (e.g. 64.0 or "64") would pass
+        # the >= comparison below but fail at runtime on the first
+        # reset. Reject up front so the failure mode is a clear
+        # ValueError, not a late IndexError or TypeError.
+        if (
+            not isinstance(self.config.warmup_bars, int)
+            or isinstance(self.config.warmup_bars, bool)
+        ):
+            raise ValueError(
+                "EnvConfig.warmup_bars must be an int, got "
+                f"{self.config.warmup_bars!r}"
+            )
         if self.config.warmup_bars < self.config.observation.window_size:
             raise ValueError(
                 "warmup_bars must be >= observation.window_size "
@@ -180,6 +194,35 @@ class TradingEnv(gym.Env):
             raise ValueError(
                 f"data has only {len(self._data)} rows; need at least "
                 f"{self.config.warmup_bars + 2} for one step after warm-up"
+            )
+        # `min_equity_fraction` gates termination. NaN / inf would
+        # silently disable the circuit breaker because
+        # `equity < initial * NaN` is always False; a value outside
+        # [0, 1] also makes no economic sense.
+        if (
+            not isinstance(self.config.min_equity_fraction, (int, float))
+            or isinstance(self.config.min_equity_fraction, bool)
+            or not math.isfinite(float(self.config.min_equity_fraction))
+            or not 0.0 <= float(self.config.min_equity_fraction) <= 1.0
+        ):
+            raise ValueError(
+                "EnvConfig.min_equity_fraction must be a finite number "
+                f"in [0.0, 1.0], got {self.config.min_equity_fraction!r}"
+            )
+        # `position_fraction` sizes every order. <= 0 silently turns
+        # every BUY/SELL into HOLD (notional <= 0 short-circuits in
+        # _apply_action); > 1 would over-leverage the account.
+        # NaN / inf produces orders the adapter rejects on every
+        # tick. Reject any of those at construction.
+        if (
+            not isinstance(self.config.position_fraction, (int, float))
+            or isinstance(self.config.position_fraction, bool)
+            or not math.isfinite(float(self.config.position_fraction))
+            or not 0.0 < float(self.config.position_fraction) <= 1.0
+        ):
+            raise ValueError(
+                "EnvConfig.position_fraction must be a finite number "
+                f"in (0.0, 1.0], got {self.config.position_fraction!r}"
             )
 
         # Precompute the static indicator series once. Indexing
