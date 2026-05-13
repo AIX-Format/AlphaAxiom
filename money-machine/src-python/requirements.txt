@@ -17,4 +17,4 @@ cryptography>=44.0.0
 # EVM transaction signing for the on-chain swap adapter.
 eth-account>=0.10.0
 # Gymnasium env contract for the RL surface in engine.rl.
-gymnasium>=0.29.0
+gymnasium>=1.3.0
