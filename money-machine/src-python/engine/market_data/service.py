@@ -28,11 +28,12 @@ backtest backfills stay under a few MB per (symbol, interval).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import tempfile
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -56,6 +57,12 @@ class MarketDataService:
         self.client = client
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        # Per-(symbol, interval) lock so concurrent get_ohlcv calls
+        # cannot read the same pre-merge snapshot and clobber each
+        # other on save. atomic file replacement protects against
+        # half-written files but not against two clean writers
+        # racing to publish a stale-then-new version.
+        self._cache_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -72,33 +79,45 @@ class MarketDataService:
 
         Reads from cache, fetches any missing segments, merges, and
         returns the slice [start_ms, end_ms).
+
+        Concurrent calls for the SAME (symbol, interval) pair are
+        serialised through a per-key asyncio.Lock so two callers
+        cannot load the same pre-merge snapshot and overwrite each
+        other on save. Calls for DIFFERENT pairs run fully
+        concurrently.
         """
         if end_ms <= start_ms:
             return self._empty_frame()
 
-        cached = self._load_cache(symbol, interval)
-        interval_ms = INTERVAL_MS.get(interval)
-        missing = self._missing_ranges(cached, start_ms, end_ms, interval_ms)
-        if missing:
-            new_rows: List[Candle] = []
-            for seg_start, seg_end in missing:
-                logger.info(
-                    "MarketDataService fetching %s %s [%d, %d)",
-                    symbol, interval, seg_start, seg_end,
-                )
-                page = await self.client.fetch_klines(
-                    symbol, interval, seg_start, seg_end
-                )
-                new_rows.extend(page)
-            if new_rows:
-                cached = self._merge(cached, new_rows)
-                self._save_cache(symbol, interval, cached)
+        key = (
+            symbol.replace("/", "").replace(":", "_").upper(),
+            interval,
+        )
+        lock = self._cache_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            cached = self._load_cache(symbol, interval)
+            interval_ms = INTERVAL_MS.get(interval)
+            missing = self._missing_ranges(cached, start_ms, end_ms, interval_ms)
+            if missing:
+                new_rows: List[Candle] = []
+                for seg_start, seg_end in missing:
+                    logger.info(
+                        "MarketDataService fetching %s %s [%d, %d)",
+                        symbol, interval, seg_start, seg_end,
+                    )
+                    page = await self.client.fetch_klines(
+                        symbol, interval, seg_start, seg_end
+                    )
+                    new_rows.extend(page)
+                if new_rows:
+                    cached = self._merge(cached, new_rows)
+                    self._save_cache(symbol, interval, cached)
 
-        window = cached[
-            (cached["open_time_ms"] >= start_ms)
-            & (cached["open_time_ms"] < end_ms)
-        ].copy()
-        return self._to_indexed_frame(window)
+            window = cached[
+                (cached["open_time_ms"] >= start_ms)
+                & (cached["open_time_ms"] < end_ms)
+            ].copy()
+            return self._to_indexed_frame(window)
 
     # ------------------------------------------------------------------
     # Cache I/O
@@ -115,16 +134,50 @@ class MarketDataService:
                 {"open_time_ms": "int64"}
             )
         try:
-            df = pd.read_csv(path)
+            # Type hints on read tell pandas how to allocate, avoid
+            # re-scanning the data, and (importantly here) coerce
+            # numeric columns at parse time so a manually-edited CSV
+            # with a stray non-numeric cell raises a clean error
+            # rather than crashing later on .astype(float).
+            df = pd.read_csv(
+                path,
+                dtype={
+                    "open_time_ms": "int64",
+                    "open": "float64",
+                    "high": "float64",
+                    "low": "float64",
+                    "close": "float64",
+                    "volume": "float64",
+                },
+            )
         except Exception as exc:
-            logger.warning("MarketDataService failed to read cache %s: %s", path, exc)
+            # Two cases hit this path: a corrupted file, or a manual
+            # edit with non-numeric cells the dtype= hint rejected.
+            # Either way we log loudly and fall back to an empty
+            # cache rather than crash; the next fetch will repopulate.
+            logger.warning(
+                "MarketDataService failed to read cache %s: %s. "
+                "Falling back to empty cache; backfill will repopulate.",
+                path, exc,
+            )
             return pd.DataFrame(columns=list(CANONICAL_COLUMNS))
-        # Hardening against external edits: keep only the columns we
-        # control, coerce types, drop bad rows.
+        # Hardening: keep only the columns we control. Use
+        # pd.to_numeric(errors="coerce") to turn any residual junk
+        # into NaN before dropping, instead of letting .astype crash.
         for col in CANONICAL_COLUMNS:
             if col not in df.columns:
                 df[col] = pd.NA
-        df = df[list(CANONICAL_COLUMNS)].dropna()
+        df = df[list(CANONICAL_COLUMNS)]
+        df["open_time_ms"] = pd.to_numeric(df["open_time_ms"], errors="coerce")
+        for col in OHLCV_COLUMNS:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        bad_rows = df.isna().any(axis=1)
+        if bad_rows.any():
+            logger.warning(
+                "MarketDataService dropping %d malformed row(s) from %s",
+                int(bad_rows.sum()), path,
+            )
+        df = df.dropna(subset=list(CANONICAL_COLUMNS))
         df["open_time_ms"] = df["open_time_ms"].astype("int64")
         for col in OHLCV_COLUMNS:
             df[col] = df[col].astype(float)

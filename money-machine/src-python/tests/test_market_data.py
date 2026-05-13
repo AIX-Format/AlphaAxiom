@@ -316,7 +316,7 @@ def test_service_fetches_only_missing_tail_segment(tmp_path: Path) -> None:
         # Exactly one upstream call, and it covers only the tail
         # gap from open_time 3*HOUR_MS to 6*HOUR_MS.
         assert len(client.calls) == 1
-        sym, interval, gap_start, gap_end = client.calls[0]
+        _, _, gap_start, gap_end = client.calls[0]
         assert gap_start >= 3 * HOUR_MS
         assert gap_end == 6 * HOUR_MS
 
@@ -370,6 +370,58 @@ class _AlwaysHold(Strategy):
             symbol=self.symbol, action="HOLD", confidence=0.0,
             strategy=self.name,
         )
+
+
+def test_service_recovers_from_corrupted_cache(tmp_path: Path) -> None:
+    """A manually-edited cache file with a non-numeric cell must not
+    crash _load_cache. The service should log a warning and fall
+    back to an empty cache so the next fetch repopulates it.
+    """
+    async def scenario() -> None:
+        client = _StubClient(_candles(0, 5))
+        svc = MarketDataService(client=client, cache_dir=tmp_path)
+        await svc.get_ohlcv("BTC/USDT", "1h", 0, 5 * HOUR_MS)
+
+        # Hand-edit one row to have a non-numeric `high` value.
+        path = next(tmp_path.glob("*.csv"))
+        lines = path.read_text().splitlines()
+        # lines[0] is the header; corrupt the middle row.
+        parts = lines[2].split(",")
+        parts[2] = "not-a-number"
+        lines[2] = ",".join(parts)
+        path.write_text("\n".join(lines) + "\n")
+
+        # Should not raise; the corrupted row is dropped silently.
+        df = await svc.get_ohlcv("BTC/USDT", "1h", 0, 5 * HOUR_MS)
+        # At least 4 of the 5 original candles survive (the bad
+        # row is dropped).
+        assert len(df) >= 4
+
+    _run(scenario())
+
+
+def test_concurrent_get_ohlcv_for_same_key_does_not_lose_writes(tmp_path: Path) -> None:
+    """Two concurrent callers fetching the same (symbol, interval)
+    must not clobber each other's cache writes.
+    """
+    async def scenario() -> None:
+        client = _StubClient(_candles(0, 10))
+        svc = MarketDataService(client=client, cache_dir=tmp_path)
+
+        async def fetcher(start: int, end: int) -> pd.DataFrame:
+            return await svc.get_ohlcv("BTC/USDT", "1h", start, end)
+
+        a, b = await asyncio.gather(
+            fetcher(0, 5 * HOUR_MS),
+            fetcher(5 * HOUR_MS, 10 * HOUR_MS),
+        )
+        assert len(a) == 5
+        assert len(b) == 5
+        # Final cache contains both ranges deduped (10 unique candles).
+        final = await svc.get_ohlcv("BTC/USDT", "1h", 0, 10 * HOUR_MS)
+        assert len(final) == 10
+
+    _run(scenario())
 
 
 def test_service_output_feeds_backtest_engine(tmp_path: Path) -> None:

@@ -7,10 +7,11 @@ Two layers:
   candles. Production uses `BinancePublicClient` which calls the
   Binance public klines REST endpoint (no API key required, rate
   limited but generous for backtest seeding).
-- `MarketDataService`: caches fetched candles to a local Parquet
-  store (CSV fallback if pyarrow is missing) and serves them back
-  as pandas DataFrames with the canonical OHLCV columns the
-  indicators and backtest modules expect.
+- `MarketDataService`: caches fetched candles to a local CSV
+  store and serves them back as pandas DataFrames with the
+  canonical OHLCV columns the indicators and backtest modules
+  expect. CSV (not Parquet) is intentional: human-readable,
+  diff-friendly, no pyarrow dependency.
 
 The split keeps the cache logic free of HTTP concerns and lets us
 swap in a CCXT-backed client, a Tinybird-backed client, or a stub
