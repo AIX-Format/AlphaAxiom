@@ -20,3 +20,23 @@ jobs:
       - name: Compile-check Python sources
         run: |
           python -m compileall -q money-machine/src-python
+
+  e2e-signal-flow:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r money-machine/src-python/requirements.txt
+          python -m pip install pytest
+
+      - name: Run E2E signal-to-execution suite (merge gate)
+        run: |
+          python -m pytest -q money-machine/src-python/tests/e2e/test_signal_to_execution_e2e.py
