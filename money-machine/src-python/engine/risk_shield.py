@@ -33,6 +33,7 @@ clock so tests stay deterministic.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -50,13 +51,50 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class RiskConfig:
-    """Tunable thresholds. All percentages are fractions in [0, 1]."""
+    """Tunable thresholds. All percentages are fractions in [0, 1].
+
+    Bounds are validated at construction. Out-of-range values would
+    silently disable core guardrails (a 200% drawdown cap never
+    trips, a negative cooldown clears the emergency stop the moment
+    it is set), so we fail fast at config build time instead.
+    """
 
     max_position_size_pct: float = 0.20
     max_concurrent_positions: int = 3
     daily_loss_limit_pct: float = 0.02
     max_drawdown_pct: float = 0.05
     cooldown_hours: float = 24.0
+
+    def __post_init__(self) -> None:
+        _require_unit_fraction("max_position_size_pct", self.max_position_size_pct)
+        _require_unit_fraction("daily_loss_limit_pct", self.daily_loss_limit_pct)
+        _require_unit_fraction("max_drawdown_pct", self.max_drawdown_pct)
+        if (
+            not isinstance(self.max_concurrent_positions, int)
+            or isinstance(self.max_concurrent_positions, bool)
+            or self.max_concurrent_positions < 1
+        ):
+            raise ValueError(
+                "max_concurrent_positions must be an int >= 1, "
+                f"got {self.max_concurrent_positions!r}"
+            )
+        if not math.isfinite(self.cooldown_hours) or self.cooldown_hours < 0.0:
+            raise ValueError(
+                "cooldown_hours must be a finite non-negative number, "
+                f"got {self.cooldown_hours!r}"
+            )
+
+
+def _require_unit_fraction(name: str, value: float) -> None:
+    """Raise ValueError unless `value` is a finite number in [0.0, 1.0]."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite number in [0, 1]") from exc
+    if not math.isfinite(v) or not 0.0 <= v <= 1.0:
+        raise ValueError(
+            f"{name} must be a finite number in [0, 1], got {value!r}"
+        )
 
 
 @dataclass
@@ -160,11 +198,12 @@ class RiskShield:
                 detail="signal is HOLD or has zero confidence",
             )
 
-        if state.equity <= 0 or state.proposed_notional < 0:
+        invalid_state_reason = self._validate_portfolio_state(state)
+        if invalid_state_reason is not None:
             return self._reject(
                 signal,
                 RejectionReason.INVALID_PORTFOLIO_STATE,
-                f"equity={state.equity}, proposed_notional={state.proposed_notional}",
+                invalid_state_reason,
             )
 
         # Rule 1: per-position size cap.
@@ -285,3 +324,38 @@ class RiskShield:
     ) -> RiskDecision:
         self.audit_rejection(signal, reason, detail)
         return RiskDecision(approved=False, reason=reason, detail=detail)
+
+    @staticmethod
+    def _validate_portfolio_state(state: PortfolioState) -> Optional[str]:
+        """Reject NaN/inf and structurally impossible portfolio inputs.
+
+        Returns a human-readable error string if the state is invalid,
+        else None. Using NaN here would let comparisons like
+        `state.equity <= 0` silently return False and approve trades
+        against a broken portfolio snapshot.
+        """
+        for name, value in (
+            ("equity", state.equity),
+            ("proposed_notional", state.proposed_notional),
+            ("daily_pnl", state.daily_pnl),
+        ):
+            if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                return f"non-finite {name}={value!r}"
+        if state.equity <= 0:
+            return f"equity must be > 0, got {state.equity!r}"
+        if state.proposed_notional < 0:
+            return f"proposed_notional must be >= 0, got {state.proposed_notional!r}"
+        if (
+            not isinstance(state.open_positions, int)
+            or isinstance(state.open_positions, bool)
+            or state.open_positions < 0
+        ):
+            return f"open_positions must be int >= 0, got {state.open_positions!r}"
+        if state.high_water_mark is not None:
+            try:
+                hwm = float(state.high_water_mark)
+            except (TypeError, ValueError):
+                return f"non-finite high_water_mark={state.high_water_mark!r}"
+            if not math.isfinite(hwm) or hwm <= 0:
+                return f"high_water_mark must be > 0, got {state.high_water_mark!r}"
+        return None

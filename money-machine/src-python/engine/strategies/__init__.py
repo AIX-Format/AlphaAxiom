@@ -15,9 +15,9 @@ from .mean_reversion import MeanReversionStrategy
 from .momentum import MomentumStrategy
 
 __all__ = [
-    "Strategy",
-    "TradingSignal",
     "BreakoutStrategy",
     "MeanReversionStrategy",
     "MomentumStrategy",
+    "Strategy",
+    "TradingSignal",
 ]

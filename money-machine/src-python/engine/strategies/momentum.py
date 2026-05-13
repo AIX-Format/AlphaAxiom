@@ -42,6 +42,25 @@ class MomentumStrategy(Strategy):
         atr_target_mult: float = 3.0,
     ) -> None:
         super().__init__(symbol)
+        for name, value in (
+            ("fast_period", fast_period),
+            ("slow_period", slow_period),
+            ("signal_period", signal_period),
+            ("trend_period", trend_period),
+            ("atr_period", atr_period),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"{name} must be int >= 1, got {value!r}")
+        if fast_period >= slow_period:
+            raise ValueError(
+                f"fast_period ({fast_period}) must be < slow_period ({slow_period})"
+            )
+        if atr_stop_mult <= 0:
+            raise ValueError(f"atr_stop_mult must be > 0, got {atr_stop_mult!r}")
+        if atr_target_mult <= 0:
+            raise ValueError(
+                f"atr_target_mult must be > 0, got {atr_target_mult!r}"
+            )
         self.fast_period = fast_period
         self.slow_period = slow_period
         self.signal_period = signal_period
@@ -60,14 +79,17 @@ class MomentumStrategy(Strategy):
             return self._hold(err)
 
         close = df["close"]
-        macd_line, signal_line, _hist = macd(
-            close,
-            fast_period=self.fast_period,
-            slow_period=self.slow_period,
-            signal_period=self.signal_period,
-        )
-        trend = ema(close, self.trend_period)
-        atr_series = atr(df["high"], df["low"], close, period=self.atr_period)
+        try:
+            macd_line, signal_line, _hist = macd(
+                close,
+                fast_period=self.fast_period,
+                slow_period=self.slow_period,
+                signal_period=self.signal_period,
+            )
+            trend = ema(close, self.trend_period)
+            atr_series = atr(df["high"], df["low"], close, period=self.atr_period)
+        except ValueError as exc:
+            return self._hold(f"invalid indicator parameters: {exc}")
 
         last_close = float(close.iloc[-1])
         last_trend = trend.iloc[-1]

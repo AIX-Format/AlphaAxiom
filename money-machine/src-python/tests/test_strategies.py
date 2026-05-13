@@ -332,6 +332,69 @@ def test_breakout_rejects_tiny_lookback() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Constructor validation: __init__ should fail fast on bad config
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"atr_period": 0},
+        {"atr_period": -3},
+        {"atr_period": True},  # bool sneaks past isinstance(int) without explicit guard
+        {"atr_period": False},
+        {"breakout_atr_mult": -0.1},
+        {"atr_stop_mult": 0},
+        {"atr_stop_mult": -1.0},
+        {"atr_target_mult": 0},
+        {"atr_target_mult": -2.0},
+    ],
+)
+def test_breakout_rejects_invalid_init_args(kwargs) -> None:
+    with pytest.raises(ValueError):
+        BreakoutStrategy("BTC/USDT", **kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"fast_period": 0},
+        {"slow_period": 0},
+        {"signal_period": 0},
+        {"trend_period": 0},
+        {"atr_period": 0},
+        {"fast_period": 30, "slow_period": 20},  # fast >= slow
+        {"atr_stop_mult": 0},
+        {"atr_stop_mult": -1.0},
+        {"atr_target_mult": 0},
+    ],
+)
+def test_momentum_rejects_invalid_init_args(kwargs) -> None:
+    with pytest.raises(ValueError):
+        MomentumStrategy("BTC/USDT", **kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"rsi_period": 0},
+        {"bb_period": 0},
+        {"atr_period": 0},
+        {"bb_num_std": 0.0},
+        {"bb_num_std": -2.0},
+        {"atr_stop_mult": 0.0},
+        {"atr_stop_mult": -1.0},
+        {"rsi_oversold": 80.0, "rsi_overbought": 20.0},  # inverted
+        {"rsi_oversold": -10.0},
+        {"rsi_overbought": 110.0},
+    ],
+)
+def test_mean_reversion_rejects_invalid_init_args(kwargs) -> None:
+    with pytest.raises(ValueError):
+        MeanReversionStrategy("BTC/USDT", **kwargs)
+
+
+# ---------------------------------------------------------------------------
 # Self-runner for environments without pytest.
 # ---------------------------------------------------------------------------
 

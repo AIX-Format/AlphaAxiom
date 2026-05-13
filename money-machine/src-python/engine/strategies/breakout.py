@@ -43,6 +43,24 @@ class BreakoutStrategy(Strategy):
         super().__init__(symbol)
         if lookback < 2:
             raise ValueError(f"lookback must be >= 2, got {lookback}")
+        if (
+            not isinstance(atr_period, int)
+            or isinstance(atr_period, bool)
+            or atr_period < 1
+        ):
+            raise ValueError(f"atr_period must be int >= 1, got {atr_period!r}")
+        if breakout_atr_mult < 0:
+            raise ValueError(
+                f"breakout_atr_mult must be >= 0, got {breakout_atr_mult!r}"
+            )
+        if atr_stop_mult <= 0:
+            raise ValueError(
+                f"atr_stop_mult must be > 0, got {atr_stop_mult!r}"
+            )
+        if atr_target_mult <= 0:
+            raise ValueError(
+                f"atr_target_mult must be > 0, got {atr_target_mult!r}"
+            )
         self.lookback = lookback
         self.atr_period = atr_period
         self.breakout_atr_mult = breakout_atr_mult
@@ -59,7 +77,10 @@ class BreakoutStrategy(Strategy):
         low = df["low"]
         close = df["close"]
 
-        atr_series = atr(high, low, close, period=self.atr_period)
+        try:
+            atr_series = atr(high, low, close, period=self.atr_period)
+        except ValueError as exc:
+            return self._hold(f"invalid indicator parameters: {exc}")
         last_atr = atr_series.iloc[-1]
         last_close = float(close.iloc[-1])
 
