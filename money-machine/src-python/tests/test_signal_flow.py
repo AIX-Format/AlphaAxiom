@@ -444,6 +444,357 @@ def test_portfolio_metrics_accept_attribute_form() -> None:
     assert result.risk_decision.approved or result.position_size > 0.0
 
 
+# ---------------------------------------------------------------------------
+# Adapter-routed execution
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_routes_through_execution_adapter() -> None:
+    """When an ExecutionAdapter is supplied, the pipeline must use
+    it. The signal must be translated into a well-formed
+    OrderRequest carrying the notional we sized, and the
+    OrderResult's status must surface in the PipelineResult
+    execution dict.
+    """
+    from engine.adapters import PaperAdapter
+
+    shield = RiskShield(clock=_frozen_clock(T0))
+    adapter = PaperAdapter(initial_balance=10_000.0)
+    adapter.set_mark_price("BTC/USDT", 50_000.0)
+
+    pipeline = SignalPipeline(
+        FixedSignalStrategy(_buy_signal()),
+        shield,
+        adapter=adapter,
+    )
+
+    result = _run(pipeline.run_once(pd.DataFrame()))
+
+    assert result.executed is True
+    assert result.execution is not None
+    assert result.execution["status"] == "FILLED"
+    assert result.execution["client_order_id"]
+    # The paper adapter holds the new position.
+    positions = _run(adapter.get_positions())
+    assert "BTC/USDT" in positions
+
+
+def test_adapter_idempotency_via_client_order_id() -> None:
+    """The adapter dedupes on client_order_id; running the same
+    signal twice within the same instant returns the cached order.
+    """
+    from engine.adapters import PaperAdapter
+
+    shield = RiskShield(clock=_frozen_clock(T0))
+    adapter = PaperAdapter(initial_balance=10_000.0)
+    adapter.set_mark_price("BTC/USDT", 50_000.0)
+
+    fixed_sig = _buy_signal()
+    pipeline = SignalPipeline(
+        FixedSignalStrategy(fixed_sig),
+        shield,
+        adapter=adapter,
+    )
+
+    first = _run(pipeline.run_once(pd.DataFrame()))
+    second = _run(pipeline.run_once(pd.DataFrame()))
+
+    assert first.execution is not None and second.execution is not None
+    assert first.executed is True
+    assert second.executed is True
+
+
+def test_pipeline_requires_adapter_or_engine() -> None:
+    shield = RiskShield(clock=_frozen_clock(T0))
+    with pytest.raises(ValueError):
+        SignalPipeline(
+            FixedSignalStrategy(_buy_signal()),
+            shield,
+        )
+
+
+def test_pipeline_rejects_both_adapter_and_engine() -> None:
+    """Supplying both is the split-book footgun the pipeline now
+    rejects: execution would go through the adapter while risk
+    state would be read from the engine's stale Portfolio.
+    """
+    from engine.adapters import PaperAdapter
+
+    portfolio = Portfolio(initial_balance=10_000.0)
+    shield = RiskShield(clock=_frozen_clock(T0))
+    with pytest.raises(ValueError, match="exactly one"):
+        SignalPipeline(
+            FixedSignalStrategy(_buy_signal()),
+            shield,
+            engine=StubEngine(portfolio=portfolio),
+            adapter=PaperAdapter(initial_balance=1_000.0),
+        )
+
+
+def test_adapter_only_pipeline_reads_balance_from_adapter() -> None:
+    """A pipeline configured with an adapter and NO engine should
+    still get an equity snapshot for the risk shield. The
+    adapter's get_balance becomes the source of truth.
+    """
+    from engine.adapters import PaperAdapter
+
+    shield = RiskShield(clock=_frozen_clock(T0))
+    adapter = PaperAdapter(initial_balance=25_000.0)
+    adapter.set_mark_price("BTC/USDT", 50_000.0)
+    pipeline = SignalPipeline(
+        FixedSignalStrategy(_buy_signal()),
+        shield,
+        adapter=adapter,
+    )
+
+    result = _run(pipeline.run_once(pd.DataFrame()))
+    assert result.executed is True
+    assert result.execution["status"] == "FILLED"
+
+
+def test_adapter_rejection_surfaces_in_pipeline_result() -> None:
+    """If the adapter rejects the order (e.g. no mark price), the
+    pipeline must NOT raise; it must return a PipelineResult with
+    execution.success=False and the adapter's error string.
+    """
+    from engine.adapters import PaperAdapter
+
+    shield = RiskShield(clock=_frozen_clock(T0))
+    # No mark price set: paper adapter will reject.
+    adapter = PaperAdapter(initial_balance=10_000.0)
+
+    pipeline = SignalPipeline(
+        FixedSignalStrategy(_buy_signal()),
+        shield,
+        adapter=adapter,
+    )
+
+    result = _run(pipeline.run_once(pd.DataFrame()))
+    # Risk shield approved (state was fine); adapter rejected.
+    assert result.risk_decision.approved is True
+    assert result.executed is True  # adapter returned a result
+    assert result.execution["success"] is False
+    assert "mark price" in (result.execution.get("error") or "")
+
+
+def test_adapter_refresh_failure_fails_closed() -> None:
+    """If the adapter's get_balance / get_positions raises, the
+    pipeline must NOT proceed with stale state. The whole tick
+    must abort with INVALID_PORTFOLIO_STATE and never call the
+    risk shield or place an order.
+    """
+    from engine.adapters import (
+        ExecutionAdapter,
+        OrderRequest,
+        OrderResult,
+        OrderSide,
+        OrderStatus,
+        OrderType,
+    )
+
+    class _BrokenAdapter(ExecutionAdapter):
+        name = "broken"
+
+        async def place_order(self, request: OrderRequest) -> OrderResult:
+            raise AssertionError("must not be called when refresh fails")
+
+        async def cancel_order(self, client_order_id: str) -> OrderResult:
+            raise AssertionError("not used here")
+
+        async def get_open_orders(self):
+            return []
+
+        async def get_positions(self):
+            raise ConnectionError("rpc down")
+
+        async def get_balance(self):
+            raise ConnectionError("rpc down")
+
+    shield = RiskShield(clock=_frozen_clock(T0))
+    pipeline = SignalPipeline(
+        FixedSignalStrategy(_buy_signal()),
+        shield,
+        adapter=_BrokenAdapter(),
+    )
+    result = _run(pipeline.run_once(pd.DataFrame()))
+
+    assert result.executed is False
+    assert result.position_size == 0.0
+    assert result.risk_decision.reason == RejectionReason.INVALID_PORTFOLIO_STATE
+    assert "portfolio refresh failed" in (result.risk_decision.detail or "")
+    # Shield was never consulted (no rule check ran).
+    assert shield.audit_log() == []
+
+
+def test_client_order_id_distinguishes_different_symbols() -> None:
+    """A naive `replace("/", "")` would let AB/CD and A/BCD collide;
+    the new hashed id MUST distinguish them.
+    """
+    from engine.signal_pipeline import SignalPipeline as SP
+
+    sig1 = TradingSignal(
+        symbol="AB/CD", action="BUY", confidence=0.5, strategy="t",
+        timestamp=1_700_000_000.0,
+    )
+    sig2 = TradingSignal(
+        symbol="A/BCD", action="BUY", confidence=0.5, strategy="t",
+        timestamp=1_700_000_000.0,
+    )
+    assert SP._client_order_id(sig1) != SP._client_order_id(sig2)
+
+
+def test_client_order_id_distinguishes_sub_millisecond_signals() -> None:
+    """Two signals one microsecond apart must produce different
+    ids; the prior millisecond truncation collapsed them.
+    """
+    from engine.signal_pipeline import SignalPipeline as SP
+
+    a = TradingSignal(
+        symbol="BTC/USDT", action="BUY", confidence=0.5, strategy="t",
+        timestamp=1_700_000_000.000001,
+    )
+    b = TradingSignal(
+        symbol="BTC/USDT", action="BUY", confidence=0.5, strategy="t",
+        timestamp=1_700_000_000.000002,
+    )
+    assert SP._client_order_id(a) != SP._client_order_id(b)
+
+
+def test_client_order_id_is_stable_for_identical_signal() -> None:
+    """Same logical signal must produce the same id every time so
+    the adapter's idempotency cache works."""
+    from engine.signal_pipeline import SignalPipeline as SP
+
+    a = TradingSignal(
+        symbol="BTC/USDT", action="BUY", confidence=0.5, strategy="t",
+        timestamp=1_700_000_000.0,
+    )
+    b = TradingSignal(
+        symbol="BTC/USDT", action="BUY", confidence=0.5, strategy="t",
+        timestamp=1_700_000_000.0,
+    )
+    assert SP._client_order_id(a) == SP._client_order_id(b)
+
+
+def test_adapter_request_preserves_signal_metadata() -> None:
+    """Strategy-emitted metadata (EVM token addresses, MT5
+    overrides, etc.) must reach adapter.place_order, not be
+    silently dropped. Without this, EVM swaps are rejected for
+    missing from_address/to_address.
+    """
+    from engine.adapters import (
+        ExecutionAdapter,
+        OrderRequest,
+        OrderResult,
+        OrderStatus,
+    )
+
+    captured: Dict[str, OrderRequest] = {}
+
+    class _CapturingAdapter(ExecutionAdapter):
+        name = "capture"
+
+        async def place_order(self, request: OrderRequest) -> OrderResult:
+            captured["request"] = request
+            return OrderResult(
+                client_order_id=request.client_order_id,
+                venue_order_id="v",
+                symbol=request.symbol,
+                side=request.side,
+                order_type=request.order_type,
+                status=OrderStatus.PENDING,
+            )
+
+        async def cancel_order(self, client_order_id: str) -> OrderResult:
+            raise AssertionError
+
+        async def get_open_orders(self):
+            return []
+
+        async def get_positions(self):
+            return {}
+
+        async def get_balance(self):
+            return 10_000.0
+
+    # Signal carries metadata the adapter MUST see.
+    sig = TradingSignal(
+        symbol="WETH/USDC",
+        action="SELL",
+        confidence=0.8,
+        strategy="evm-test",
+        entry_price=2000.0,
+        stop_loss=1900.0,
+        take_profit=2200.0,
+        metadata={
+            "from_address": "0xWETH...",
+            "to_address": "0xUSDC...",
+            "expected_amount_out": 2000.0,
+        },
+    )
+    pipeline = SignalPipeline(
+        FixedSignalStrategy(sig),
+        RiskShield(clock=_frozen_clock(T0)),
+        adapter=_CapturingAdapter(),
+    )
+    result = _run(pipeline.run_once(pd.DataFrame()))
+    assert result.executed is True
+    sent = captured["request"]
+    assert sent.metadata["from_address"] == "0xWETH..."
+    assert sent.metadata["to_address"] == "0xUSDC..."
+    assert sent.metadata["expected_amount_out"] == 2000.0
+    # Pipeline also stamps its own observability field.
+    assert "signal_timestamp" in sent.metadata
+
+
+def test_cancelled_adapter_result_does_not_count_as_success() -> None:
+    """An adapter that returns CANCELLED (venue refused or cancelled
+    mid-flight) must show up as execution.success=False so
+    downstream metrics do not over-count wins.
+    """
+    from engine.adapters import (
+        ExecutionAdapter,
+        OrderRequest,
+        OrderResult,
+        OrderStatus,
+    )
+
+    class _CancellingAdapter(ExecutionAdapter):
+        name = "canceller"
+
+        async def place_order(self, request: OrderRequest) -> OrderResult:
+            return OrderResult(
+                client_order_id=request.client_order_id,
+                venue_order_id="v",
+                symbol=request.symbol,
+                side=request.side,
+                order_type=request.order_type,
+                status=OrderStatus.CANCELLED,
+            )
+
+        async def cancel_order(self, client_order_id: str) -> OrderResult:
+            raise AssertionError
+
+        async def get_open_orders(self):
+            return []
+
+        async def get_positions(self):
+            return {}
+
+        async def get_balance(self):
+            return 10_000.0
+
+    pipeline = SignalPipeline(
+        FixedSignalStrategy(_buy_signal()),
+        RiskShield(clock=_frozen_clock(T0)),
+        adapter=_CancellingAdapter(),
+    )
+    result = _run(pipeline.run_once(pd.DataFrame()))
+    assert result.executed is True
+    assert result.execution["status"] == "CANCELLED"
+    assert result.execution["success"] is False
+
+
 def test_drawdown_trip_via_pipeline_flow() -> None:
     """End-to-end: portfolio drops past max_drawdown_pct, next signal
     is rejected with MAX_DRAWDOWN and the shield is in emergency

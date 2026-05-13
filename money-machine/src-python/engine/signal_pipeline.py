@@ -27,6 +27,14 @@ from typing import Any, Dict, Optional, Protocol
 
 import pandas as pd
 
+from .adapters import (
+    ExecutionAdapter,
+    OrderRequest,
+    OrderResult,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+)
 from .position_sizing import fixed_fractional
 from .risk_shield import (
     PortfolioState,
@@ -98,25 +106,63 @@ class PipelineConfig:
 
 
 class SignalPipeline:
-    """Strategy + risk + sizing + execution, wired end-to-end."""
+    """Strategy + risk + sizing + execution, wired end-to-end.
+
+    Exactly one execution backend must be supplied:
+
+    - **Adapter** (`ExecutionAdapter` from `engine.adapters`). The
+      pipeline builds an `OrderRequest` from the signal and calls
+      `adapter.place_order`. This is the path every new venue
+      (paper, MT5, CCXT, EVM, Solana) plugs into. The adapter
+      also becomes the portfolio source via `get_balance` /
+      `get_positions`.
+
+    - **Legacy engine** (`SupportsExecute`). Pre-adapter callers
+      pass an object exposing `engine.execute_trade(params)` and
+      `engine.portfolio`. Kept for backward compatibility while
+      strategies migrate.
+
+    Supplying BOTH is rejected: mixing them would route execution
+    through the adapter while reading risk-shield state from the
+    engine's stale Portfolio, which is exactly the kind of split
+    book that approves orders against the wrong balance.
+    """
 
     def __init__(
         self,
         strategy: Strategy,
         risk_shield: RiskShield,
-        engine: SupportsExecute,
+        engine: Optional[SupportsExecute] = None,
         config: Optional[PipelineConfig] = None,
         *,
+        adapter: Optional[ExecutionAdapter] = None,
         execute_live: bool = True,
     ) -> None:
+        if adapter is None and engine is None:
+            raise ValueError(
+                "SignalPipeline requires exactly one execution backend "
+                "(adapter or engine), got neither"
+            )
+        if adapter is not None and engine is not None:
+            raise ValueError(
+                "SignalPipeline requires exactly one execution backend; "
+                "got both adapter and engine. The engine's Portfolio "
+                "would not see adapter fills, leading to a split book."
+            )
         self.strategy = strategy
         self.risk_shield = risk_shield
         self.engine = engine
+        self.adapter = adapter
         self.config = config or PipelineConfig()
-        # `execute_live=False` short-circuits the execute_trade call
-        # so the pipeline can be used in paper / shadow mode without
-        # touching the exchange adapter.
+        # `execute_live=False` short-circuits the execution call so
+        # the pipeline can be used in paper / shadow mode without
+        # touching the venue.
         self.execute_live = execute_live
+        # Instance-scoped caches for adapter portfolio snapshots.
+        # Defined here (not as class attributes) so two pipelines
+        # cannot accidentally share state on a mutable dict.
+        self._adapter_balance_cache: float = 0.0
+        self._adapter_positions_cache: Dict[str, float] = {}
 
     # ------------------------------------------------------------------
 
@@ -130,6 +176,39 @@ class SignalPipeline:
         and downstream telemetry (audit log, dashboards) sees the
         failure instead of an opaque crash.
         """
+        # Refresh adapter portfolio cache up front so `_equity` and
+        # `_open_position_count` can stay sync helpers downstream.
+        # We do this whenever an adapter is configured (even if a
+        # legacy engine is also present) because the adapter is the
+        # source of truth for whichever backend will actually
+        # execute the trade. Fail CLOSED on read errors: if we
+        # cannot trust the portfolio snapshot we must not approve
+        # new orders against stale state.
+        if self.adapter is not None:
+            try:
+                self._adapter_balance_cache = float(await self.adapter.get_balance())
+                self._adapter_positions_cache = dict(await self.adapter.get_positions())
+            except Exception as exc:
+                logger.error(
+                    "Adapter portfolio refresh failed; failing closed: %s", exc
+                )
+                fallback = TradingSignal(
+                    symbol=getattr(self.strategy, "symbol", ""),
+                    action="HOLD",
+                    confidence=0.0,
+                    strategy=getattr(self.strategy, "name", ""),
+                    reasoning=f"adapter portfolio refresh failed: {exc}",
+                )
+                return PipelineResult(
+                    signal=fallback,
+                    risk_decision=RiskDecision(
+                        approved=False,
+                        reason=RejectionReason.INVALID_PORTFOLIO_STATE,
+                        detail=f"adapter portfolio refresh failed: {exc}",
+                    ),
+                    position_size=0.0,
+                )
+
         try:
             signal = self.strategy.generate_signal(df)
         except Exception as exc:
@@ -244,14 +323,30 @@ class SignalPipeline:
         sit on a 10% open drawdown all day and only trip the
         emergency stop after the position was closed, which defeats
         the point of `daily_loss_limit`.
+
+        Adapter-only pipelines (no legacy engine) get daily_pnl=0
+        and high_water_mark=equity because a stateless venue cannot
+        tell us either. The first PR that ships a stateful adapter
+        bookkeeping layer can override this method or extend the
+        snapshot helper.
         """
-        portfolio = self.engine.portfolio
         equity = self._equity()
         open_positions = self._open_position_count()
-        daily_pnl = self._read_metric(portfolio, "daily_pnl", default=0.0)
-        unrealised = self._read_metric(portfolio, "calculate_pnl", default=0.0)
-        daily_pnl_total = float(daily_pnl) + float(unrealised)
-        hwm = self._read_metric(portfolio, "high_water_mark", default=equity)
+        # daily_pnl and high_water_mark come from the engine
+        # Portfolio if we have one AND the adapter is NOT executing
+        # (otherwise the engine Portfolio is stale relative to
+        # actual fills). When the adapter is the execution backend
+        # these default to 0 / equity; a stateful portfolio decorator
+        # for adapters is the natural follow-up.
+        portfolio = self._portfolio() if self.adapter is None else None
+        if portfolio is not None:
+            daily_pnl = self._read_metric(portfolio, "daily_pnl", default=0.0)
+            unrealised = self._read_metric(portfolio, "calculate_pnl", default=0.0)
+            daily_pnl_total = float(daily_pnl) + float(unrealised)
+            hwm = self._read_metric(portfolio, "high_water_mark", default=equity)
+        else:
+            daily_pnl_total = 0.0
+            hwm = equity
         return PortfolioState(
             equity=equity,
             open_positions=open_positions,
@@ -282,14 +377,26 @@ class SignalPipeline:
             return float(default)
 
     def _equity(self) -> float:
-        portfolio = self.engine.portfolio
+        # When an adapter is the execution backend, the adapter's
+        # balance is the source of truth (it reflects fills that
+        # bypass the legacy engine's Portfolio). Fall back to the
+        # engine's portfolio only when no adapter is configured.
+        if self.adapter is not None:
+            return float(self._adapter_balance_cache)
+        portfolio = self._portfolio()
+        if portfolio is None:
+            return 0.0
         getter = getattr(portfolio, "get_balance", None)
         if callable(getter):
             return float(getter())
         return float(getattr(portfolio, "balance", 0.0))
 
     def _open_position_count(self) -> int:
-        portfolio = self.engine.portfolio
+        if self.adapter is not None:
+            return len(self._adapter_positions_cache)
+        portfolio = self._portfolio()
+        if portfolio is None:
+            return 0
         getter = getattr(portfolio, "get_positions", None)
         positions = getter() if callable(getter) else getattr(portfolio, "positions", {})
         try:
@@ -297,21 +404,114 @@ class SignalPipeline:
         except TypeError:
             return 0
 
+    def _portfolio(self) -> Any:
+        """Return the portfolio-state source for daily PnL and HWM.
+
+        Only consulted when no adapter is configured. The engine's
+        Portfolio owns daily_pnl and high_water_mark history that
+        a stateless adapter cannot provide. When an adapter IS the
+        execution backend its balance/positions are read from the
+        cached snapshot in `_equity` / `_open_position_count` and
+        daily_pnl/HWM default to 0/equity.
+        """
+        if self.engine is not None:
+            return getattr(self.engine, "portfolio", None)
+        return None
+
+
+
     async def _execute(
         self,
         signal: TradingSignal,
         notional: float,
     ) -> Optional[Dict[str, Any]]:
-        """Send the order to the engine adapter.
+        """Send the order to whichever execution backend is configured.
 
         When `execute_live` is False the pipeline returns a shadow
         execution record so callers can still see what would have
         happened. This is the paper-trading hook.
+
+        When an `ExecutionAdapter` is configured the order goes
+        through `adapter.place_order` and the `OrderResult` is
+        translated into the execution dict. Otherwise the legacy
+        `engine.execute_trade(params)` path is used.
         """
+        if not self.execute_live:
+            order_type = "buy" if signal.action == "BUY" else "sell"
+            entry_price = signal.entry_price or 0.0
+            amount = notional / entry_price if entry_price > 0.0 else 0.0
+            return {
+                "success": True,
+                "shadow": True,
+                "order_id": f"shadow_{signal.timestamp}",
+                "params": {
+                    "symbol": signal.symbol,
+                    "order_type": order_type,
+                    "amount": amount,
+                    "price": signal.entry_price,
+                    "notional": notional,
+                    "strategy": signal.strategy,
+                },
+            }
+
+        if self.adapter is not None:
+            return await self._execute_via_adapter(signal, notional)
+        return await self._execute_via_engine(signal, notional)
+
+    async def _execute_via_adapter(
+        self, signal: TradingSignal, notional: float
+    ) -> Dict[str, Any]:
+        side = OrderSide.BUY if signal.action == "BUY" else OrderSide.SELL
+        # Preserve strategy-emitted metadata so venue-specific
+        # fields (EVM from_address/to_address, MT5 instrument
+        # overrides, etc.) survive the trip through the pipeline.
+        # The pipeline only adds its own observability fields on
+        # top; it never silently drops what the strategy set.
+        metadata = dict(signal.metadata or {})
+        metadata["signal_timestamp"] = signal.timestamp
+        request = OrderRequest(
+            client_order_id=self._client_order_id(signal),
+            symbol=signal.symbol,
+            side=side,
+            order_type=OrderType.MARKET,
+            notional=float(notional),
+            limit_price=None,
+            stop_loss=signal.stop_loss,
+            take_profit=signal.take_profit,
+            strategy=signal.strategy,
+            metadata=metadata,
+        )
+        try:
+            result: OrderResult = await self.adapter.place_order(request)
+        except Exception as exc:
+            logger.error("adapter.place_order raised: %s", exc)
+            return {"success": False, "error": str(exc)}
+        # CANCELLED is a non-success terminal state (venue rejected
+        # the order or cancelled it mid-flight); only PENDING /
+        # PARTIAL / FILLED count as the order actually progressing.
+        successful_statuses = {
+            OrderStatus.PENDING,
+            OrderStatus.PARTIAL,
+            OrderStatus.FILLED,
+        }
+        return {
+            "success": result.status in successful_statuses,
+            "order_id": result.venue_order_id,
+            "client_order_id": result.client_order_id,
+            "status": result.status.value,
+            "filled_quantity": result.filled_quantity,
+            "average_fill_price": result.average_fill_price,
+            "error": result.error,
+        }
+
+    async def _execute_via_engine(
+        self, signal: TradingSignal, notional: float
+    ) -> Optional[Dict[str, Any]]:
+        if self.engine is None:
+            return {"success": False, "error": "no execution backend configured"}
         order_type = "buy" if signal.action == "BUY" else "sell"
         entry_price = signal.entry_price or 0.0
         amount = notional / entry_price if entry_price > 0.0 else 0.0
-
         params: Dict[str, Any] = {
             "symbol": signal.symbol,
             "order_type": order_type,
@@ -320,17 +520,43 @@ class SignalPipeline:
             "notional": notional,
             "strategy": signal.strategy,
         }
-
-        if not self.execute_live:
-            return {
-                "success": True,
-                "shadow": True,
-                "order_id": f"shadow_{signal.timestamp}",
-                "params": params,
-            }
-
         try:
             return await self.engine.execute_trade(params)
         except Exception as exc:  # pragma: no cover - defensive
             logger.error("execute_trade raised: %s", exc)
             return {"success": False, "error": str(exc)}
+
+    @staticmethod
+    def _client_order_id(signal: TradingSignal) -> str:
+        """Stable per-signal client order id.
+
+        Adapters use this as the idempotency key. The contract is
+        "same logical signal -> same id", so a retry on a transient
+        error reuses the existing venue order rather than placing a
+        duplicate. Two requirements that fight each other:
+
+          1. Sub-millisecond signals (fast backtest, tight live
+             loop) must produce DIFFERENT ids; truncating
+             `signal.timestamp` to milliseconds collapsed two
+             distinct events into one.
+          2. Different markets must produce DIFFERENT ids; the old
+             `replace("/", "")` mapping let `AB/CD` and `A/BCD`
+             collide.
+
+        Resolution: keep the strategy + raw symbol + action + full
+        timestamp in the id, hash the whole thing with sha256 (12
+        bytes truncated, base16 encoded) so the result is filesystem
+        / header-safe regardless of input characters. The hash is
+        deterministic on identical inputs and globally distinct on
+        anything else.
+        """
+        import hashlib
+
+        ts = float(signal.timestamp)
+        strategy = signal.strategy or "unknown"
+        # Preserve the full timestamp precision so sub-ms distinct
+        # signals do not collide. repr() gives us 17 digits, which
+        # is enough to round-trip a Python float.
+        raw = f"{strategy}|{signal.symbol}|{signal.action}|{ts!r}"
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+        return f"sp-{digest}"
