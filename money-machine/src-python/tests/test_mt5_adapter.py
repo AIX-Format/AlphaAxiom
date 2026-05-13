@@ -740,6 +740,39 @@ def test_get_open_orders_uses_lock_for_consistent_snapshot() -> None:
     _run(scenario())
 
 
+def test_mt5_import_does_not_pull_in_paper_or_evm_modules() -> None:
+    """Importing MT5Adapter from engine.adapters must NOT
+    transitively load PaperAdapter (which pulls pandas/numpy via
+    engine.backtest) or the EVMAdapter (eth-account). An MT5-only
+    runtime should not pay for adapters it does not use.
+
+    Runs the import in a clean subprocess so it does not pollute
+    the rest of the test process's sys.modules.
+    """
+    import os
+    import subprocess
+
+    script = (
+        "import sys\n"
+        "from engine.adapters import MT5Adapter\n"
+        "print('paper_loaded=' + str('engine.adapters.paper' in sys.modules))\n"
+        "print('evm_loaded=' + str('engine.adapters.evm' in sys.modules))\n"
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(SRC_PYTHON)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, (
+        f"subprocess failed: stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "paper_loaded=False" in result.stdout, result.stdout
+    assert "evm_loaded=False" in result.stdout, result.stdout
+
+
 def test_get_balance_returns_configured_account_equity() -> None:
     """Pipeline reads adapter.get_balance() as equity; the MT5
     adapter must therefore return a usable value, not 0.0.
