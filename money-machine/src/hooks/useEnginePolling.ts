@@ -2,17 +2,17 @@
 
 import { useEffect, useCallback } from 'react';
 import { useAppStore } from '@/store/useAppStore';
-import { getPortfolio, getStatus, ping } from '@/lib/tauri';
+import { getPortfolio, getShadowReport, getStatus, ping } from '@/lib/tauri';
 
 /**
  * Hook to poll engine data at regular intervals
  */
 export function useEnginePolling(intervalMs: number = 5000) {
-    const { setPortfolio, setEngineStatus, setConnected, setError } = useAppStore((state) => ({
+    const { setPortfolio, setEngineStatus, setError, setShadowReport } = useAppStore((state) => ({
         setPortfolio: state.setPortfolio,
         setEngineStatus: state.setEngineStatus,
-        setConnected: (connected: boolean) => useAppStore.setState({ connected }),
         setError: state.setError,
+        setShadowReport: state.setShadowReport,
     }));
 
     const fetchData = useCallback(async () => {
@@ -31,13 +31,20 @@ export function useEnginePolling(intervalMs: number = 5000) {
             // Fetch portfolio
             const portfolio = await getPortfolio();
             setPortfolio(portfolio);
+            const shadow = await getShadowReport(60);
+            setShadowReport({
+                drift_rate: shadow.drift_rate,
+                error_rate: shadow.error_rate,
+                compared: shadow.compared,
+                accepted: shadow.accepted,
+            });
 
             setError(null);
         } catch (err) {
             console.error('Engine polling error:', err);
             setError(err instanceof Error ? err.message : 'Unknown error');
         }
-    }, [setPortfolio, setEngineStatus, setError]);
+    }, [setPortfolio, setEngineStatus, setError, setShadowReport]);
 
     useEffect(() => {
         // Initial fetch

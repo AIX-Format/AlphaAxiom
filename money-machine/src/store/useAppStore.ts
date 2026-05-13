@@ -38,6 +38,12 @@ interface AppState {
     // UI State
     loading: boolean;
     error: string | null;
+    shadowReport: {
+        drift_rate: number;
+        error_rate: number;
+        compared: number;
+        accepted: boolean;
+    };
 
     // Actions
     setTradingActive: (active: boolean) => void;
@@ -46,6 +52,7 @@ interface AppState {
     addTrade: (trade: Trade) => void;
     setLoading: (loading: boolean) => void;
     setError: (error: string | null) => void;
+    setShadowReport: (report: AppState['shadowReport']) => void;
 }
 
 export const useAppStore = create<AppState>((set) => ({
@@ -65,6 +72,12 @@ export const useAppStore = create<AppState>((set) => ({
 
     loading: false,
     error: null,
+    shadowReport: {
+        drift_rate: 0,
+        error_rate: 0,
+        compared: 0,
+        accepted: false,
+    },
 
     // Actions
     setTradingActive: (active) => set({ tradingActive: active }),
@@ -85,4 +98,5 @@ export const useAppStore = create<AppState>((set) => ({
     setLoading: (loading) => set({ loading }),
 
     setError: (error) => set({ error }),
+    setShadowReport: (report) => set({ shadowReport: report }),
 }));

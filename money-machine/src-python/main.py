@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from engine.trading_core import TradingEngine
 from engine.signal_generator import SignalGenerator
+from engine.shadow_mode import ShadowDecision, ShadowModeMonitor
 from skills.skill_executor import SkillExecutor
 from utils.ipc_server import IPCServer
 from utils.hot_reload import HotReloadManager
@@ -31,6 +32,7 @@ class MoneyMachineApp:
         self.ipc_server = None
         self.running = True
         self.config = None
+        self.shadow_monitor = ShadowModeMonitor()
     
     async def initialize(self):
         """Initialize all components"""
@@ -93,6 +95,7 @@ class MoneyMachineApp:
             "GENERATE_SIGNAL": self.cmd_generate_signal,
             "GET_LAST_SIGNAL": self.cmd_get_last_signal,
             "RELOAD_SKILLS": self.cmd_reload_skills,
+            "GET_SHADOW_REPORT": self.cmd_get_shadow_report,
         }
         
         handler = handlers.get(command)
@@ -169,7 +172,10 @@ class MoneyMachineApp:
             portfolio_balance=self.engine.portfolio.get_balance()
         )
         
-        return signal.to_dict()
+        signal_dict = signal.to_dict()
+        if payload.get("shadow_mode", True):
+            self._record_shadow_decision(symbol, signal_dict)
+        return signal_dict
     
     async def cmd_get_last_signal(self, payload: dict) -> dict:
         """Get the last generated signal for a symbol"""
@@ -192,6 +198,40 @@ class MoneyMachineApp:
             "new_count": new_count
         }
 
+    async def cmd_get_shadow_report(self, payload: dict) -> dict:
+        """Return shadow mode comparison dashboard metrics."""
+        window_minutes = int(payload.get("window_minutes", 60))
+        return self.shadow_monitor.summary(window_minutes=window_minutes)
+
+    def _record_shadow_decision(self, symbol: str, signal: dict) -> None:
+        """Store dry-run decision and compare against baseline strategy."""
+        balance = float(self.engine.portfolio.get_balance())
+        risk_pct = float(signal.get("amount") or 0.0)
+        size = balance * risk_pct
+        decision = ShadowDecision(
+            timestamp=float(signal.get("timestamp", 0.0)) or self.engine.get_server_time(),
+            symbol=symbol,
+            entry=signal.get("entry_price"),
+            size=size,
+            risk=risk_pct,
+            exit=signal.get("take_profit"),
+            action=signal.get("action", "HOLD"),
+            confidence=float(signal.get("confidence", 0.0)),
+        )
+        self.shadow_monitor.record_decision(decision, baseline=False)
+        baseline_action = "HOLD" if decision.confidence < 0.55 else decision.action
+        baseline = ShadowDecision(
+            timestamp=decision.timestamp,
+            symbol=symbol,
+            entry=decision.entry,
+            size=size * 0.9,
+            risk=risk_pct * 0.9,
+            exit=decision.exit,
+            action=baseline_action,
+            confidence=decision.confidence,
+        )
+        self.shadow_monitor.record_decision(baseline, baseline=True)
+
 
 async def main():
     """Main entry point"""
@@ -211,4 +251,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
