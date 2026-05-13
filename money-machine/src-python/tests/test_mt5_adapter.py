@@ -500,6 +500,51 @@ def test_response_non_dict_body_does_not_crash() -> None:
     _run(scenario())
 
 
+def test_concurrent_place_order_same_id_submits_once() -> None:
+    """Two coroutines calling place_order with the same
+    client_order_id in parallel must hit the relay exactly once.
+    The second caller awaits the in-flight Future instead of
+    re-signing and re-POSTing.
+    """
+    async def scenario() -> None:
+        slow_event = asyncio.Event()
+
+        async def slow_http(method, url, headers, body):
+            # Hold the first request open so the second caller has
+            # time to enter place_order and observe the in-flight
+            # placeholder.
+            await slow_event.wait()
+            return HttpResponse(status=202, body=b'{"venue_order_id":"v-only"}', headers={})
+
+        call_count = [0]
+
+        async def counting_http(method, url, headers, body):
+            call_count[0] += 1
+            return await slow_http(method, url, headers, body)
+
+        adapter = MT5Adapter(http_client=counting_http, signer=_signer())
+
+        async def caller():
+            return await adapter.place_order(_request("ord-concurrent"))
+
+        first = asyncio.create_task(caller())
+        # Give the first call a chance to mark in-flight.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        second = asyncio.create_task(caller())
+        await asyncio.sleep(0)
+        # Now release the HTTP response.
+        slow_event.set()
+
+        r1, r2 = await asyncio.gather(first, second)
+        assert r1.status is OrderStatus.PENDING
+        assert r1 == r2
+        # The relay was hit ONCE despite two place_order calls.
+        assert call_count[0] == 1
+
+    _run(scenario())
+
+
 def test_get_open_orders_uses_lock_for_consistent_snapshot() -> None:
     """Sanity: even under no contention, get_open_orders returns a
     coherent snapshot list rather than iterating the live dict.

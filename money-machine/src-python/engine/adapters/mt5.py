@@ -208,6 +208,12 @@ class MT5Adapter(ExecutionAdapter):
         # Anything PENDING is also cached so a retry sees the same
         # response without re-signing.
         self._order_cache: Dict[str, OrderResult] = {}
+        # In-flight placeholder map: when a place_order call is mid
+        # HTTP retry, its client_order_id maps to a Future here so a
+        # concurrent caller for the same id awaits the original
+        # result instead of submitting a duplicate signed signal.
+        # Cleared once the result lands in `_order_cache`.
+        self._in_flight: Dict[str, "asyncio.Future[OrderResult]"] = {}
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
@@ -218,8 +224,10 @@ class MT5Adapter(ExecutionAdapter):
         # Build the signed envelope under the lock (short, in-memory
         # only), then release the lock before the HTTP call so a
         # slow/timing-out relay request does NOT serialise every
-        # other order on this adapter instance. We re-acquire only
-        # to persist the final result in the idempotency cache.
+        # other order on this adapter instance. An in-flight Future
+        # parked in `self._in_flight` makes concurrent calls for the
+        # SAME client_order_id wait on the original result rather
+        # than racing to sign and POST a duplicate signal.
         async with self._lock:
             cached = self._order_cache.get(request.client_order_id)
             if cached is not None:
@@ -228,49 +236,70 @@ class MT5Adapter(ExecutionAdapter):
                     request.client_order_id,
                 )
                 return cached
+            inflight = self._in_flight.get(request.client_order_id)
+            if inflight is not None:
+                logger.debug(
+                    "MT5 place_order awaiting in-flight call for %s",
+                    request.client_order_id,
+                )
+                # Release the lock before awaiting; the original
+                # caller will set the Future's result when its HTTP
+                # round trip completes.
+                pass
+            else:
+                err = self._validate_request(request)
+                if err is not None:
+                    result = self._rejected(request, err)
+                    self._order_cache[request.client_order_id] = result
+                    return result
 
-            err = self._validate_request(request)
-            if err is not None:
-                result = self._rejected(request, err)
-                self._order_cache[request.client_order_id] = result
-                return result
+                payload = self._build_payload(request)
+                canonical = canonical_payload(payload)
+                try:
+                    signature_hex = self.signer(canonical).hex()
+                except Exception as exc:
+                    # AdapterError is included here; the adapter
+                    # contract is "no exceptions, return REJECTED"
+                    # and signing is a routine failure path
+                    # (missing keychain entry, libsodium quirk).
+                    result = self._rejected(request, f"signing failed: {exc}")
+                    self._order_cache[request.client_order_id] = result
+                    return result
 
-            payload = self._build_payload(request)
-            canonical = canonical_payload(payload)
-            try:
-                signature_hex = self.signer(canonical).hex()
-            except Exception as exc:
-                # AdapterError is included here; the adapter contract
-                # is "no exceptions, return REJECTED" and signing is
-                # a routine failure path (missing keychain entry,
-                # libsodium quirk, etc.).
-                result = self._rejected(request, f"signing failed: {exc}")
-                self._order_cache[request.client_order_id] = result
-                return result
+                envelope = {
+                    "payload": payload,
+                    "signature": signature_hex,
+                    "public_key_id": self.public_key_id,
+                }
+                body = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
+                headers = {
+                    "Content-Type": "application/json",
+                    "X-Client-Order-Id": request.client_order_id,
+                    "X-Public-Key-Id": self.public_key_id,
+                }
+                url = self.config.oracle_url.rstrip("/") + "/signals"
 
-            envelope = {
-                "payload": payload,
-                "signature": signature_hex,
-                "public_key_id": self.public_key_id,
-            }
-            body = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
-            headers = {
-                "Content-Type": "application/json",
-                "X-Client-Order-Id": request.client_order_id,
-                "X-Public-Key-Id": self.public_key_id,
-            }
-            url = self.config.oracle_url.rstrip("/") + "/signals"
+                # Mark this id as in-flight; concurrent callers see
+                # the Future and await it instead of re-signing.
+                future: "asyncio.Future[OrderResult]" = asyncio.get_event_loop().create_future()
+                self._in_flight[request.client_order_id] = future
+
+        if inflight is not None:
+            return await inflight
 
         # Lock released; the retry loop runs without head-of-line
         # blocking other client_order_ids.
-        response = await self._post_with_retries(url, headers, body)
-        result = self._result_from_response(request, response)
+        try:
+            response = await self._post_with_retries(url, headers, body)
+            result = self._result_from_response(request, response)
+        except Exception as exc:  # defensive; _post_with_retries should not raise
+            result = self._rejected(request, f"unexpected transport failure: {exc}")
+
         async with self._lock:
-            # Last-writer wins, but the idempotency cache check at
-            # the top means a competing retry of the SAME id would
-            # have returned the prior cached result instead of
-            # getting here.
             self._order_cache[request.client_order_id] = result
+            self._in_flight.pop(request.client_order_id, None)
+        if not future.done():
+            future.set_result(result)
         return result
 
     async def cancel_order(self, client_order_id: str) -> OrderResult:
