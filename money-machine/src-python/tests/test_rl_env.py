@@ -404,6 +404,37 @@ def test_env_rejects_invalid_position_fraction() -> None:
             )
 
 
+def test_env_rejects_invalid_seed() -> None:
+    """EnvConfig.seed flows straight into Gymnasium's
+    `super().reset(seed=...)` which requires a non-negative int
+    or None. A string, float, bool, or negative int would
+    otherwise raise on the first reset; reject at construction.
+    """
+    df = _build_df([100.0 + i * 0.1 for i in range(40)])
+    adapter = PaperAdapter(initial_balance=10_000.0)
+    for bad in ("42", 1.5, -1, True):
+        with pytest.raises(ValueError, match="seed"):
+            TradingEnv(
+                df,
+                adapter,
+                EnvConfig(
+                    seed=bad,  # type: ignore[arg-type]
+                    warmup_bars=20,
+                    observation=ObservationConfig(window_size=8),
+                ),
+            )
+    # None is allowed (no seed = stochastic).
+    TradingEnv(
+        df,
+        adapter,
+        EnvConfig(
+            seed=None,
+            warmup_bars=20,
+            observation=ObservationConfig(window_size=8),
+        ),
+    )
+
+
 def test_paper_adapter_reset_rejects_non_finite_initial_balance() -> None:
     """A NaN initial_balance would land in `_balance` and corrupt
     every later cash comparison via NaN propagation."""

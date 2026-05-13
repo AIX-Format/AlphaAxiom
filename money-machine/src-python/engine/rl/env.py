@@ -224,6 +224,21 @@ class TradingEnv(gym.Env):
                 "EnvConfig.position_fraction must be a finite number "
                 f"in (0.0, 1.0], got {self.config.position_fraction!r}"
             )
+        # `seed` is forwarded straight into `super().reset(seed=...)`
+        # which Gymnasium strictly requires to be a non-negative
+        # Python int or None. A string ("42"), float, bool, or
+        # negative int would otherwise raise on the first reset
+        # call - turning a config typo into a late crash mid-
+        # training. Reject up-front with a clear ValueError.
+        if self.config.seed is not None and (
+            not isinstance(self.config.seed, int)
+            or isinstance(self.config.seed, bool)
+            or self.config.seed < 0
+        ):
+            raise ValueError(
+                "EnvConfig.seed must be None or a non-negative int, "
+                f"got {self.config.seed!r}"
+            )
 
         # Precompute the static indicator series once. Indexing
         # them during step keeps each tick O(1) instead of
