@@ -404,6 +404,90 @@ def test_cancel_unknown_order_returns_rejection() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Signing failure caching in place_order
+# ---------------------------------------------------------------------------
+
+
+def test_signing_failure_in_place_order_is_cached() -> None:
+    """A signing failure during place_order must be persisted to
+    _order_cache. A later retry with the same client_order_id must
+    return the cached REJECTED result instead of re-attempting to
+    sign and POST.
+
+    This tests the new caching behaviour introduced in this PR:
+    unlike transient HSM blips where retrying the same id would
+    loop forever, the rejection is now written to the cache so the
+    caller must submit a new client_order_id to retry.
+    """
+    async def scenario() -> None:
+        http = _FakeHttp([])
+        sign_call_count = [0]
+
+        def always_failing_signer(payload: bytes) -> bytes:
+            sign_call_count[0] += 1
+            raise RuntimeError("keychain entry missing")
+
+        adapter = MT5Adapter(http_client=http, signer=always_failing_signer)
+
+        # First attempt: signing throws → REJECTED, no HTTP call.
+        first = await adapter.place_order(_request("ord-signing-cached"))
+        assert first.status is OrderStatus.REJECTED
+        assert "signing failed" in (first.error or "")
+        assert http.calls == []
+        assert sign_call_count[0] == 1
+
+        # Second attempt with the SAME id: the cached REJECTED must
+        # be returned immediately without invoking the signer again.
+        second = await adapter.place_order(_request("ord-signing-cached"))
+        assert second.status is OrderStatus.REJECTED
+        assert second.client_order_id == first.client_order_id
+        # Signer must NOT have been called a second time.
+        assert sign_call_count[0] == 1
+        # Still no HTTP traffic.
+        assert http.calls == []
+
+    _run(scenario())
+
+
+def test_signing_failure_cached_result_blocks_successful_retry() -> None:
+    """Once a signing failure is cached, a subsequent call with the
+    same client_order_id cannot succeed even if the signer recovers.
+
+    This is the key trade-off of the new caching strategy: the
+    cached REJECTED acts as a permanent short-circuit for that id.
+    Callers that need to retry after a transient failure must use
+    a fresh client_order_id.
+    """
+    async def scenario() -> None:
+        http = _FakeHttp([
+            HttpResponse(status=202, body=b'{"venue_order_id":"v-recovered"}', headers={}),
+        ])
+        real = _signer()
+        call_count = [0]
+
+        def flaky_then_ok_signer(payload: bytes) -> bytes:
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise RuntimeError("transient failure")
+            return real(payload)
+
+        adapter = MT5Adapter(http_client=http, signer=flaky_then_ok_signer)
+
+        # First attempt fails → REJECTED is cached.
+        first = await adapter.place_order(_request("ord-no-retry"))
+        assert first.status is OrderStatus.REJECTED
+
+        # Second attempt with same id: cache hit → still REJECTED,
+        # signer is NOT called, no HTTP request made.
+        second = await adapter.place_order(_request("ord-no-retry"))
+        assert second.status is OrderStatus.REJECTED
+        assert call_count[0] == 1  # signer was only called once
+        assert http.calls == []    # relay was never reached
+
+    _run(scenario())
+
+
+# ---------------------------------------------------------------------------
 # Keychain signer
 # ---------------------------------------------------------------------------
 
