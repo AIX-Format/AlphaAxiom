@@ -57,21 +57,6 @@ from engine.rl.reward import (  # noqa: E402
 
 
 def _build_df(closes: List[float], *, atr_pct: float = 0.005) -> pd.DataFrame:
-    """
-    Create an OHLCV pandas DataFrame from a sequence of close prices with an hourly UTC index.
-    
-    Parameters:
-        closes (List[float]): Sequence of close prices; length determines number of rows.
-        atr_pct (float): Fraction of the price midpoint used to expand high/low around the open/close midpoint.
-    
-    Returns:
-        pd.DataFrame: DataFrame indexed by hourly UTC timestamps with columns:
-            - `open`: previous close (first open equals first close)
-            - `high`: max(open, close) plus `atr_pct` of the midpoint
-            - `low`: min(open, close) minus `atr_pct` of the midpoint
-            - `close`: provided close prices
-            - `volume`: constant 100.0 for all rows
-    """
     n = len(closes)
     idx = pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC")
     opens = [closes[0]] + closes[:-1]
@@ -102,20 +87,6 @@ def _build_env(
     window_size: int = 16,
     warmup_bars: int = 20,
 ) -> TradingEnv:
-    """
-    Builds a TradingEnv configured from synthetic OHLCV data derived from the provided close prices.
-    
-    Parameters:
-        closes (List[float]): Sequence of close prices used to synthesize an OHLCV DataFrame.
-        initial_equity (float): Starting account equity for the environment.
-        position_fraction (float): Fraction of equity used for target position sizing on filled orders.
-        allow_short (bool): Whether the environment permits opening short positions.
-        window_size (int): Number of past bars included in the observation window.
-        warmup_bars (int): Number of initial bars used to warm up indicators before stepping.
-    
-    Returns:
-        TradingEnv: A TradingEnv instance constructed with the synthesized data, a paper trading adapter, and the specified configuration.
-    """
     df = _build_df(closes)
     adapter = PaperAdapter(
         initial_balance=initial_equity,
@@ -200,11 +171,6 @@ def test_turnover_penalty_charges_direction_flip_only() -> None:
 
 
 def test_sharpe_reward_smooths_over_window() -> None:
-    """
-    Validates that SharpeRatioReward smooths returns over its window and handles zero variance safely.
-    
-    Asserts that a constant return stream yields a zero reward (safety branch for zero variance), and that a sequence with non-zero variance produces a finite, strictly positive Sharpe reward.
-    """
     r = SharpeRatioReward(window=10, scale=1.0)
     # Feed a stable 1% return stream; Sharpe should be a finite,
     # large positive number after a few steps.
@@ -256,12 +222,6 @@ def test_composite_safe_coerces_each_component_independently() -> None:
     """
 
     def bad_component(**kwargs: object) -> float:
-        """
-        Return a NaN-valued reward component.
-        
-        Returns:
-            float: A `NaN` value indicating an invalid or non-finite component.
-        """
         return float("nan")
 
     fn = composite(
@@ -341,10 +301,10 @@ def test_env_blocks_short_when_disallowed() -> None:
 
 
 def test_sell_with_slippage_does_not_open_short_when_disallowed() -> None:
-    """
-    Ensure a SELL action with nonzero slippage cannot create a short position when shorting is disabled.
-    
-    This test opens a long position and issues repeated SELL actions while using a PaperAdapter configured with significant fixed slippage. It asserts the environment clamps any slippage-induced overshoot so the resulting position never becomes negative (tolerating tiny numerical noise by allowing positions >= -1e-9).
+    """Pre-cap notional + post-fill clamp: a SELL with nonzero
+    slippage might fill at a worse price and end up reducing the
+    position by MORE than the long. The post-fill clamp must keep
+    the position at exactly 0 in that case.
     """
     df = _build_df([100.0 + i * 0.1 for i in range(40)])
     adapter = PaperAdapter(
@@ -455,10 +415,8 @@ def test_env_invalid_action_raises() -> None:
 
 
 def test_env_rejects_non_integer_action() -> None:
-    """
-    Verify that env.step rejects non-integer action inputs and raises ValueError.
-    
-    Asserts that a float action (e.g., 1.9) is not silently coerced to an int and that non-integer types (e.g., the string "BUY") raise ValueError.
+    """Float actions must NOT be silently coerced via int(). A policy
+    bug that produces 1.9 should fail fast, not execute BUY.
     """
     env = _build_env(closes=[100.0 + i for i in range(40)])
     env.reset()
@@ -469,22 +427,15 @@ def test_env_rejects_non_integer_action() -> None:
 
 
 def test_env_config_seed_used_when_reset_seed_omitted() -> None:
-    """
-    Verifies that two environments constructed with the same EnvConfig.seed produce identical observations when reset() is called without an explicit seed.
-    
-    Asserts the observations returned by env.reset() for both environments are elementwise close using numpy's testing utilities.
+    """Two envs with the same EnvConfig.seed should produce
+    identical observation sequences from reset() (no explicit
+    seed argument). The previous code only honoured the method
+    argument, making the config knob a no-op for the typical
+    `env.reset()` call pattern.
     """
     df = _build_df([100.0 + 0.5 * i for i in range(60)])
 
     def fresh_env() -> TradingEnv:
-        """
-        Create a TradingEnv configured with a default PaperAdapter and EnvConfig using the module-level `df`.
-        
-        The environment uses a PaperAdapter with 10,000 initial balance, zero commission, and zero slippage, and an EnvConfig for symbol "BTC/USDT", initial equity 10,000, warmup bars 20, seed 42, and an ObservationConfig with window_size 8.
-        
-        Returns:
-            TradingEnv: A ready-to-use TradingEnv built from `df` with the defaults described above.
-        """
         adapter = PaperAdapter(
             initial_balance=10_000.0,
             commission=FlatCommission(rate=0.0),
@@ -528,26 +479,16 @@ def test_env_rejects_too_short_data() -> None:
 
 
 def test_env_runs_inside_running_event_loop() -> None:
-    """
-    Ensure the environment does not call asyncio.run from inside an active event loop.
-    
-    Runs reset() and several step() calls within an asyncio event loop and asserts that no RuntimeError is raised and the environment's cumulative step counter increments as expected.
+    """The env must not call `asyncio.run` per step; otherwise it
+    blows up when used inside a running event loop (RLlib worker,
+    Jupyter, async test harness). Drive a few steps from inside an
+    async function and confirm no `RuntimeError` is raised.
     """
     import asyncio
 
     env = _build_env(closes=[100.0 + i for i in range(40)], window_size=8, warmup_bars=20)
 
     async def drive() -> int:
-        """
-        Advance the environment through five predefined actions while running inside an active event loop.
-        
-        Executes a reset of the shared `env` and performs the action sequence
-        [ACTION_BUY, ACTION_HOLD, ACTION_SELL, ACTION_HOLD, ACTION_BUY] by calling
-        `env.step(...)` for each action.
-        
-        Returns:
-            int: The environment's cumulative step count after performing the actions.
-        """
         env.reset()
         # 5 alternating actions inside an active event loop.
         for action in [ACTION_BUY, ACTION_HOLD, ACTION_SELL, ACTION_HOLD, ACTION_BUY]:
@@ -573,15 +514,6 @@ def test_indicators_are_precomputed_once() -> None:
     original = env_module.rsi
 
     def counting(*args, **kwargs):
-        """
-        Increment a shared call counter and invoke the wrapped callable with the provided arguments.
-        
-        Increments call_count[0] as a side effect, then forwards all positional and keyword
-        arguments to the original callable and returns its result.
-        
-        Returns:
-            The value returned by the wrapped callable.
-        """
         call_count[0] += 1
         return original(*args, **kwargs)
 
@@ -598,10 +530,10 @@ def test_indicators_are_precomputed_once() -> None:
 
 
 def test_position_observation_is_scale_invariant_weight() -> None:
-    """
-    Assert that the position feature in the observation is the position-value fraction (position * price) / equity rather than raw quantity.
-    
-    The test opens equivalent fractional positions in a high-priced asset (BTC-like) and a low-priced asset (SHIB-like) and checks that the position-weight observation for both is approximately 0.5 (50% of equity).
+    """Position in the observation must be `(position * price) /
+    equity`, not the raw quantity. A BTC long of 0.1 at price 50k
+    on a 10k equity should show position weight ≈ 0.5; a SHIB long
+    of 5e7 at price 1e-5 on the same equity should also show ≈ 0.5.
     """
     # BTC-like asset: high price, small position size.
     closes_btc = [50_000.0] * 40
@@ -653,8 +585,9 @@ def test_paper_adapter_reset_clears_state() -> None:
 
 
 def test_env_passes_gymnasium_env_checker() -> None:
-    """
-    Check that the TradingEnv implementation complies with Gymnasium's API contract by running gymnasium.utils.env_checker.check_env.
+    """The official Gymnasium env_checker runs reset/step/close,
+    verifies space shapes, dtypes, and seeding behaviour. If
+    anything in the contract drifts this test catches it.
     """
     from gymnasium.utils.env_checker import check_env
 
@@ -663,3 +596,342 @@ def test_env_passes_gymnasium_env_checker() -> None:
     # skip_render_check=True skips that path and focuses on the
     # core contract.
     check_env(env.unwrapped, skip_render_check=True)
+
+
+# ---------------------------------------------------------------------------
+# TradingEnv: additional edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_env_rejects_warmup_bars_less_than_window_size() -> None:
+    """warmup_bars < window_size must raise ValueError at construction
+    time. Without this guard the observation window cannot be fully
+    populated at the start of an episode.
+    """
+    df = _build_df([100.0 + i for i in range(40)])
+    adapter = PaperAdapter(initial_balance=10_000.0)
+    config = EnvConfig(
+        warmup_bars=5,
+        observation=ObservationConfig(window_size=16),
+    )
+    with pytest.raises(ValueError, match="warmup_bars must be >= observation.window_size"):
+        TradingEnv(df, adapter, config)
+
+
+def test_env_allows_warmup_bars_exactly_equal_to_window_size() -> None:
+    """warmup_bars == window_size is the minimum valid value and must
+    not raise.
+    """
+    df = _build_df([100.0 + i for i in range(40)])
+    adapter = PaperAdapter(initial_balance=10_000.0)
+    config = EnvConfig(
+        warmup_bars=16,
+        observation=ObservationConfig(window_size=16),
+    )
+    env = TradingEnv(df, adapter, config)
+    obs, info = env.reset()
+    assert obs.shape == (16 + 5,)
+
+
+def test_env_allows_short_when_configured() -> None:
+    """With allow_short=True, a SELL from flat must open a short
+    position (negative quantity) rather than being blocked.
+    """
+    df = _build_df([100.0 + i for i in range(40)])
+    adapter = PaperAdapter(
+        initial_balance=10_000.0,
+        commission=FlatCommission(rate=0.0),
+        slippage=FixedSlippage(bps=0.0),
+    )
+    config = EnvConfig(
+        symbol="BTC/USDT",
+        initial_equity=10_000.0,
+        position_fraction=0.1,
+        allow_short=True,
+        warmup_bars=20,
+        observation=ObservationConfig(window_size=16),
+    )
+    env = TradingEnv(df, adapter, config)
+    env.reset()
+    # SELL from flat: should open a short when allow_short=True.
+    _, _, _, _, info = env.step(ACTION_SELL)
+    assert info["fill"]["status"] == "FILLED"
+    assert env._position < 0.0
+
+
+def test_env_step_info_contains_all_documented_keys() -> None:
+    """step() info must contain step, equity, position, bar_index,
+    prev_peak_equity, new_peak_equity, step_return, and fill.
+    """
+    env = _build_env(closes=[100.0 + i for i in range(40)])
+    env.reset()
+    _, _, _, _, info = env.step(ACTION_HOLD)
+    required_keys = {
+        "step", "equity", "position", "bar_index",
+        "prev_peak_equity", "new_peak_equity", "step_return", "fill",
+    }
+    assert required_keys.issubset(info.keys()), (
+        f"Missing keys: {required_keys - info.keys()}"
+    )
+
+
+def test_env_peak_equity_never_decreases() -> None:
+    """_peak_equity must be a running maximum: even after a price
+    drop that reduces equity, the peak must remain at its high-water
+    mark and never fall below it.
+    """
+    closes = [100.0] * 25 + [120.0, 130.0, 110.0, 90.0, 80.0]
+    env = _build_env(
+        closes=closes,
+        window_size=8,
+        warmup_bars=20,
+        position_fraction=0.5,
+    )
+    env.reset()
+    env.step(ACTION_BUY)  # Build a position before the rally
+
+    peak_seen = env._peak_equity
+    for _ in range(len(closes) - 20 - 2):
+        env.step(ACTION_HOLD)
+        assert env._peak_equity >= peak_seen, (
+            f"peak_equity decreased: was {peak_seen}, now {env._peak_equity}"
+        )
+        peak_seen = env._peak_equity
+
+
+def test_env_reset_restores_cumulative_steps_and_position() -> None:
+    """After a sequence of steps, reset() must restore the env to
+    the same state as a fresh episode: cumulative_steps=0, position=0,
+    and equity back to initial.
+    """
+    env = _build_env(closes=[100.0 + i for i in range(40)])
+    env.reset()
+    for _ in range(5):
+        env.step(ACTION_BUY)
+
+    assert env._cumulative_steps == 5
+    assert env._position > 0.0
+
+    env.reset()
+
+    assert env._cumulative_steps == 0
+    assert env._position == 0.0
+    assert env._equity == pytest.approx(10_000.0)
+    assert env._peak_equity == pytest.approx(10_000.0)
+
+
+def test_env_observation_values_clipped_to_box_bounds() -> None:
+    """All observation values must lie within [-10, 10] per the
+    declared Box space, even for extreme price movements that would
+    otherwise produce very large normalised values.
+    """
+    # A sudden 100x price spike would produce extreme normalised closes
+    # without clipping.
+    closes = [100.0] * 25 + [10_000.0] * 15
+    env = _build_env(closes=closes, window_size=8, warmup_bars=20)
+    env.reset()
+    for _ in range(14):
+        obs, _, _, _, _ = env.step(ACTION_HOLD)
+        assert np.all(obs >= -10.0) and np.all(obs <= 10.0), (
+            f"observation out of [-10, 10] bounds: min={obs.min()}, max={obs.max()}"
+        )
+
+
+def test_env_equity_norm_zero_at_reset() -> None:
+    """The equity_norm component (last element of the observation) is
+    `(equity / initial_equity) - 1`. At reset the equity equals
+    initial_equity, so equity_norm must be exactly 0.
+    """
+    env = _build_env(closes=[100.0 + i for i in range(40)])
+    obs, _ = env.reset()
+    equity_norm = float(obs[-1])
+    assert equity_norm == pytest.approx(0.0, abs=1e-6)
+
+
+def test_safe_indicator_returns_fallback_for_nan() -> None:
+    """_safe_indicator must return the fallback when the array
+    contains NaN at the requested bar index.
+    """
+    arr = np.array([1.0, float("nan"), 3.0])
+    result = TradingEnv._safe_indicator(arr, bar=1, fallback=99.0)
+    assert result == pytest.approx(99.0)
+
+
+def test_safe_indicator_returns_fallback_for_inf() -> None:
+    """_safe_indicator must return the fallback when the value is inf."""
+    arr = np.array([1.0, float("inf"), 3.0])
+    result = TradingEnv._safe_indicator(arr, bar=1, fallback=42.0)
+    assert result == pytest.approx(42.0)
+
+
+def test_safe_indicator_returns_fallback_for_out_of_range_bar() -> None:
+    """Bar indices out of [0, array_length) must return the fallback."""
+    arr = np.array([1.0, 2.0, 3.0])
+    assert TradingEnv._safe_indicator(arr, bar=-1, fallback=7.0) == pytest.approx(7.0)
+    assert TradingEnv._safe_indicator(arr, bar=10, fallback=7.0) == pytest.approx(7.0)
+
+
+def test_safe_indicator_returns_actual_value_for_valid_bar() -> None:
+    """For a valid bar with a finite value the indicator itself is returned."""
+    arr = np.array([10.0, 20.0, 30.0])
+    assert TradingEnv._safe_indicator(arr, bar=1, fallback=0.0) == pytest.approx(20.0)
+
+
+def test_env_validate_data_rejects_empty_dataframe() -> None:
+    """An empty DataFrame must raise ValueError at construction."""
+    df = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    adapter = PaperAdapter(initial_balance=10_000.0)
+    with pytest.raises(ValueError, match="non-empty OHLCV DataFrame"):
+        TradingEnv(df, adapter, EnvConfig(warmup_bars=20))
+
+
+# ---------------------------------------------------------------------------
+# Reward function: additional edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_drawdown_penalty_fallback_when_peak_missing_from_info() -> None:
+    """When info lacks 'prev_peak_equity', the reward function must
+    fall back to `prev_equity` as the implicit peak and compute
+    drawdown relative to that.
+    """
+    r = DrawdownPenaltyReward(weight=1.0)
+    # No peak info: prev_peak defaults to prev_equity (10000), so
+    # prev_dd = 0. new_peak defaults to max(prev_peak, new_equity).
+    # new_equity 9000 < prev_peak 10000 -> new_dd = (10000-9000)/10000 = 0.1.
+    out = r(
+        prev_equity=10_000.0,
+        new_equity=9_000.0,
+        prev_position=0.0,
+        new_position=0.0,
+        info={},  # no peak keys
+    )
+    assert out == pytest.approx(-0.1, rel=1e-6)
+
+
+def test_drawdown_penalty_weighted() -> None:
+    """weight != 1.0 must scale the penalty proportionally."""
+    r_unit = DrawdownPenaltyReward(weight=1.0)
+    r_half = DrawdownPenaltyReward(weight=0.5)
+    info = {"prev_peak_equity": 10_000.0, "new_peak_equity": 10_000.0}
+    out_unit = r_unit(prev_equity=10_000.0, new_equity=9_000.0,
+                      prev_position=0.0, new_position=0.0, info=info)
+    out_half = r_half(prev_equity=10_000.0, new_equity=9_000.0,
+                      prev_position=0.0, new_position=0.0, info=info)
+    assert out_half == pytest.approx(out_unit * 0.5, rel=1e-6)
+
+
+def test_drawdown_penalty_zero_on_new_equity_high() -> None:
+    """If new equity exceeds the previous peak (a new high-water mark),
+    there is no new drawdown, so the penalty must be 0.
+    """
+    r = DrawdownPenaltyReward(weight=1.0)
+    # Equity rises from 10k -> 11k (new peak). No additional drawdown.
+    info = {"prev_peak_equity": 10_000.0, "new_peak_equity": 11_000.0}
+    out = r(
+        prev_equity=10_000.0, new_equity=11_000.0,
+        prev_position=0.0, new_position=0.0,
+        info=info,
+    )
+    assert out == pytest.approx(0.0)
+
+
+def test_sharpe_reward_returns_zero_with_single_sample() -> None:
+    """With fewer than 2 samples there is no variance to compute;
+    the reward must return 0.0 for the first step.
+    """
+    r = SharpeRatioReward(window=10, scale=1.0)
+    out = r(
+        prev_equity=1.0, new_equity=1.01,
+        prev_position=0.0, new_position=0.0,
+        info={"step_return": 0.01},
+    )
+    assert out == pytest.approx(0.0)
+
+
+def test_sharpe_reward_window_eviction_updates_running_stats() -> None:
+    """After the window is full, each new return must evict the oldest
+    so the running sum/sumsq stay consistent with a fresh computation
+    over only the last `window` entries.
+    """
+    import math as _math
+
+    window = 5
+    r = SharpeRatioReward(window=window, scale=1.0)
+    # Fill the window with 5 values; then add one more that evicts the first.
+    returns = [0.01, 0.02, -0.01, 0.03, -0.02, 0.015]
+    for ret in returns:
+        last = r(
+            prev_equity=1.0, new_equity=1.0,
+            prev_position=0.0, new_position=0.0,
+            info={"step_return": ret},
+        )
+
+    # After 6 steps the window holds returns[1:6].
+    window_returns = returns[1:]  # last 5
+    n = len(window_returns)
+    mean = sum(window_returns) / n
+    var = sum((x - mean) ** 2 for x in window_returns) / n
+    expected = (mean / _math.sqrt(var)) if var > 1e-12 else 0.0
+    assert last == pytest.approx(expected, rel=1e-3)
+
+
+def test_sharpe_reward_negative_scale_flips_sign() -> None:
+    """A negative scale should produce a negative Sharpe reward for
+    a positive mean return, allowing reward inversion for adversarial
+    training scenarios.
+    """
+    r_pos = SharpeRatioReward(window=10, scale=1.0)
+    r_neg = SharpeRatioReward(window=10, scale=-1.0)
+    seq = [0.01, -0.005, 0.012, -0.003, 0.008, -0.004, 0.011, -0.002, 0.009, -0.001]
+    out_pos, out_neg = 0.0, 0.0
+    for s in seq:
+        out_pos = r_pos(prev_equity=1.0, new_equity=1.0,
+                        prev_position=0.0, new_position=0.0,
+                        info={"step_return": s})
+        out_neg = r_neg(prev_equity=1.0, new_equity=1.0,
+                        prev_position=0.0, new_position=0.0,
+                        info={"step_return": s})
+    assert out_neg == pytest.approx(-out_pos, rel=1e-6)
+
+
+def test_composite_with_zero_components_returns_zero() -> None:
+    """composite() with no arguments must return 0.0 (empty sum)."""
+    fn = composite()
+    out = fn(
+        prev_equity=10_000.0, new_equity=10_100.0,
+        prev_position=0.0, new_position=0.0,
+        info={},
+    )
+    assert out == pytest.approx(0.0)
+
+
+def test_composite_with_inf_component_coerces_to_zero() -> None:
+    """A component returning +inf must be coerced to 0 so the other
+    components' contributions are not tainted.
+    """
+    def inf_component(**kwargs: object) -> float:
+        return float("inf")
+
+    fn = composite(
+        PnLReward(as_return=True, scale=1.0),
+        inf_component,
+    )
+    out = fn(
+        prev_equity=10_000.0, new_equity=10_100.0,
+        prev_position=0.0, new_position=0.0,
+        info={},
+    )
+    # PnL = 0.01, inf -> 0.0, total = 0.01.
+    assert out == pytest.approx(0.01, rel=1e-6)
+
+
+def test_pnl_reward_scale_applied_in_return_mode() -> None:
+    """scale must multiply the return even when as_return=True."""
+    r = PnLReward(as_return=True, scale=10.0)
+    out = r(
+        prev_equity=10_000.0, new_equity=10_100.0,
+        prev_position=0.0, new_position=0.0, info={},
+    )
+    # return = 0.01, scaled = 0.1.
+    assert out == pytest.approx(0.1, rel=1e-6)
