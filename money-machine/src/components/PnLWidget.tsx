@@ -3,6 +3,13 @@
 import { motion } from 'framer-motion';
 import { useAppStore } from '@/store/useAppStore';
 
+/**
+ * Render a styled P&L widget showing today's profit or loss, the portfolio balance, and the current mode.
+ *
+ * The widget conditionally styles its appearance based on whether the P&L is >= 0, formats numeric values to two decimal places, and includes entry/scale animations for the container and amount.
+ *
+ * @returns A JSX element displaying today's P&L (prefixing positive values with `+`), the portfolio balance, and the mode label.
+ */
 export function PnLWidget() {
     const { portfolio } = useAppStore();
     const pnl = portfolio.pnl;

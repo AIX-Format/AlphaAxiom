@@ -17,6 +17,12 @@ export const metadata: Metadata = {
   description: "AI-powered trading overlay for AlphaAxiom.",
 };
 
+/**
+ * Top-level HTML layout that applies global font variables and renders the app content.
+ *
+ * @param children - The page or route content to render inside the document body.
+ * @returns The root `<html>` element containing a `<body>` with global font classes and `children`.
+ */
 export default function RootLayout({
   children,
 }: Readonly<{

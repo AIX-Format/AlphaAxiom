@@ -183,19 +183,49 @@ class TradingEngine:
         return self._connected
     
     def get_uptime(self) -> float:
+        """
+        Compute how many seconds have elapsed since the engine was started.
+        
+        Returns:
+            uptime_seconds (float): Seconds elapsed since the engine's start time.
+        """
         return (datetime.now() - self.start_time).total_seconds()
     
     async def update_config(self, new_config: dict):
-        """Update safe runtime configuration on the fly."""
+        """
+        Apply validated runtime configuration updates to the engine's configuration.
+        
+        Parameters:
+            new_config (dict): Mapping of configuration keys to numeric values to update. Keys must be supported runtime config fields and values must be numeric (not boolean) and within the allowed ranges.
+        
+        Raises:
+            ValueError: If `new_config` is not a dict, contains unsupported keys, contains non-numeric or boolean values, or contains values outside the allowed ranges.
+        """
         self.config.update(validate_config_update(new_config))
     
     async def close(self):
-        """Cleanup resources"""
+        """
+        Close any active exchange connection and free related resources.
+        
+        If an exchange client was initialized, close its connection.
+        """
         if self.exchange:
             await self.exchange.close()
 
 
 def validate_config_update(new_config: dict) -> dict:
+    """
+    Validate and normalize runtime configuration updates against CONFIG_LIMITS.
+    
+    Parameters:
+        new_config (dict): Mapping of configuration keys to numeric values to apply.
+    
+    Returns:
+        dict: A new dict containing the validated configuration keys with values converted to float.
+    
+    Raises:
+        ValueError: If `new_config` is not a dict, if a key is unsupported, if a value is not a numeric (non-boolean) type, or if a value falls outside the allowed range defined in `CONFIG_LIMITS`.
+    """
     if not isinstance(new_config, dict):
         raise ValueError("config update must be an object")
     validated: dict = {}

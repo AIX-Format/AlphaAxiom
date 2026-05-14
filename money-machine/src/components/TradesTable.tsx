@@ -3,6 +3,15 @@
 import { motion } from 'framer-motion';
 import { useAppStore, Trade } from '@/store/useAppStore';
 
+/**
+ * Render a list of recent trades with animated rows and an empty-state for shadow mode.
+ *
+ * This component reads `trades` from the application store and displays each trade with side badge,
+ * symbol, amount/price, PnL (colored by sign), and a formatted time. If there are no trades, it
+ * shows a dashed empty-state card indicating that shadow mode is waiting for verified signals.
+ *
+ * @returns A React element displaying recent trades or an empty-state card when no trades are available.
+ */
 export function TradesTable() {
     const { trades } = useAppStore();
 

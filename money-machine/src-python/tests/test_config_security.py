@@ -15,6 +15,11 @@ from utils import config as config_module  # noqa: E402
 
 
 def test_save_config_redacts_nested_secrets(tmp_path, monkeypatch) -> None:
+    """
+    Verifies that save_config persists a config.json with secret fields removed.
+    
+    Calls save_config with a nested configuration containing exchange.api_key, exchange.secret, and gemini_api_key and asserts the written config.json retains only non-secret fields (exchange.name and max_risk_per_trade).
+    """
     fake_config_module_path = tmp_path / "utils" / "config.py"
     fake_config_module_path.parent.mkdir()
     fake_config_module_path.write_text("")

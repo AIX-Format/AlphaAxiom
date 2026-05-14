@@ -53,6 +53,18 @@ class IPCServer:
         burst_limit: Optional[float] = None,
         read_timeout_seconds: float = DEFAULT_READ_TIMEOUT_SECONDS,
     ):
+        """
+        Initialize the IPC server with network, authentication, rate-limiting, and read timeout configuration.
+        
+        Parameters:
+            command_handler (CommandHandler): Async callable invoked as (command, payload) to handle requests.
+            host (str): IP address to bind the server to.
+            port (int): TCP port to listen on.
+            auth_token (Optional[str]): Hex authentication token to require from clients; if None a default token is resolved.
+            rate_limit (Optional[float]): Tokens-per-second rate for the global token bucket; uses DEFAULT_RATE when None.
+            burst_limit (Optional[float]): Capacity (burst size) for the token bucket; uses DEFAULT_BURST when None.
+            read_timeout_seconds (float): Per-read timeout in seconds applied when reading the auth header and JSON body.
+        """
         self.host = host
         self.port = port
         self.command_handler = command_handler
@@ -104,7 +116,17 @@ class IPCServer:
             logger.debug("Connection closed from %s", addr)
 
     async def _process_request(self, reader: asyncio.StreamReader) -> dict:
-        """Read auth header + JSON body, return a response dict."""
+        """
+        Process a single IPC request from the provided StreamReader using the two-line protocol: an auth header line followed by a JSON body line.
+        
+        Reads and validates the auth header, applies the global token-bucket rate limit after successful authentication, reads and parses the JSON request body, ensures a non-empty "command" field is present, and dispatches to the configured command handler. On protocol, authentication, rate-limit, or JSON-parsing errors, returns an error dictionary with keys "error" and "code".
+        
+        Parameters:
+            reader (asyncio.StreamReader): Stream reader to read the incoming request lines from.
+        
+        Returns:
+            dict: The response produced by the command handler, or an error dictionary containing "error" and "code".
+        """
         auth_line_bytes, auth_error = await self._read_limited_line(
             reader, self.MAX_AUTH_LINE_BYTES, "auth header"
         )
@@ -152,6 +174,23 @@ class IPCServer:
         limit: int,
         label: str,
     ) -> tuple[bytes, Optional[dict]]:
+        """
+        Read a single newline-terminated line from `reader`, enforcing a per-read timeout and a maximum byte limit.
+        
+        Parameters:
+            reader (asyncio.StreamReader): Stream reader to read the line from.
+            limit (int): Maximum allowed bytes for the line (inclusive). Lines longer than this produce an error.
+            label (str): Human-readable label used in error messages (e.g., "auth header" or "request body").
+        
+        Returns:
+            tuple[bytes, Optional[dict]]: A pair (line, error). On success `line` contains the bytes read (including the trailing newline) and `error` is `None`. On failure `line` is `b""` and `error` is a dict with keys `error` (message) and `code` (HTTP-like status code):
+                - Timeout reading the line → code 408.
+                - Line exceeds `limit` → code 413.
+                - Other read failures → code 400.
+        
+        Notes:
+            If the underlying read raises `asyncio.IncompleteReadError`, the function returns the partial bytes read as `line` (and no error) so the caller can decide how to handle an unterminated stream.
+        """
         try:
             line = await asyncio.wait_for(
                 reader.readuntil(b"\n"),
@@ -171,7 +210,11 @@ class IPCServer:
         return line, None
 
     async def stop(self) -> None:
-        """Stop the server."""
+        """
+        Close the running asyncio server and wait for it to finish closing.
+        
+        If the server was not started, this is a no-op.
+        """
         if self.server:
             self.server.close()
             await self.server.wait_closed()

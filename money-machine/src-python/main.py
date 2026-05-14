@@ -204,7 +204,24 @@ class MoneyMachineApp:
         return self.shadow_monitor.summary(window_minutes=window_minutes)
 
     def _record_shadow_decision(self, symbol: str, signal: dict) -> None:
-        """Store dry-run decision and compare against baseline strategy."""
+        """
+        Record an AI-generated (dry-run) trading decision and record a derived baseline decision for shadow-mode comparison.
+        
+        Creates and records a non-baseline ShadowDecision using the provided signal and current portfolio balance (position size = balance * metadata['amount_pct'] or 0.0). Then creates and records a baseline ShadowDecision that:
+        - uses "HOLD" when confidence < 0.55, otherwise uses the AI action,
+        - scales `size` and `risk` by 0.9,
+        - preserves timestamp, symbol, entry, exit, and confidence.
+        
+        Parameters:
+            symbol (str): Trading symbol for the decision (e.g., "BTC/USDT").
+            signal (dict): Signal payload; expected keys include:
+                - "metadata" (dict) with optional "amount_pct" (interpreted as fraction of balance),
+                - "timestamp" (optional numeric),
+                - "entry_price",
+                - "take_profit",
+                - "action" (optional),
+                - "confidence" (optional numeric).
+        """
         balance = float(self.engine.portfolio.get_balance())
         metadata = signal.get("metadata") or {}
         risk_pct = float(metadata.get("amount_pct") or 0.0)

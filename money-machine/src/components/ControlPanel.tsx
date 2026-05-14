@@ -5,6 +5,13 @@ import { motion } from 'framer-motion';
 import { useAppStore } from '@/store/useAppStore';
 import { startTrading, stopTrading, setAlwaysOnTop, setIgnoreMouseEvents } from '@/lib/tauri';
 
+/**
+ * Render the Mission Control panel with trading and window controls.
+ *
+ * Displays connection status, a supervised "shadow trading" toggle, window behavior toggles (Pinned/Floating and Ghost/Interactive), and quick action buttons; interactive controls are disabled when the app is not connected.
+ *
+ * @returns A JSX element that renders the Mission Control UI with trading controls, window behavior toggles, and quick actions.
+ */
 export function ControlPanel() {
     const { tradingActive, setTradingActive, connected } = useAppStore();
     const [loading, setLoading] = useState(false);

@@ -3,6 +3,11 @@
 import { motion } from 'framer-motion';
 import { useAppStore } from '@/store/useAppStore';
 
+/**
+ * Displays an animated engine status widget showing connection, trading state, skills loaded, formatted uptime, a fixed oracle host, and shadow report metrics (drift, error rate, and acceptance).
+ *
+ * @returns The JSX element for the status widget
+ */
 export function StatusWidget() {
     const { connected, tradingActive, skillsLoaded, uptime, shadowReport } = useAppStore();
 
