@@ -11,7 +11,14 @@ SECRET_KEYS = frozenset({"api_key", "secret", "gemini_api_key"})
 
 
 def load_config() -> Dict[str, Any]:
-    """Load configuration from environment variables and config file"""
+    """
+    Builds the application configuration from environment variables and an optional config.json file.
+    
+    If a config.json file is present, its values are merged into the environment-based defaults after removing secret-bearing keys; if the file cannot be read or parsed a warning is printed and the environment defaults are used unchanged.
+    
+    Returns:
+        dict: Configuration dictionary with defaults from environment variables, updated by non-secret values from config.json when available.
+    """
     
     config = {
         # Default values
@@ -49,6 +56,15 @@ def load_config() -> Dict[str, Any]:
 
 
 def _deep_merge(base: Dict[str, Any], update: Dict[str, Any]) -> None:
+    """
+    Recursively merge keys from `update` into `base`, mutating `base` in place.
+    
+    For keys present in both mappings whose values are dictionaries, their mappings are merged recursively; for all other keys the value from `update` replaces the value in `base`.
+    
+    Parameters:
+        base (Dict[str, Any]): The target mapping to be updated; this object is modified in place.
+        update (Dict[str, Any]): The source mapping whose keys and values are merged into `base`.
+    """
     for key, value in update.items():
         if isinstance(value, dict) and isinstance(base.get(key), dict):
             _deep_merge(base[key], value)
@@ -57,7 +73,17 @@ def _deep_merge(base: Dict[str, Any], update: Dict[str, Any]) -> None:
 
 
 def _without_secrets(value: Any) -> Any:
-    """Return a copy with secret-bearing keys removed before disk use."""
+    """
+    Produce a copy of `value` with any dictionary entries whose key (case-insensitive) is in `SECRET_KEYS` removed.
+    
+    Recursively processes dictionaries and lists; non-dict/list values are returned unchanged.
+    
+    Parameters:
+        value (Any): The input structure (dict, list, or other) to cleanse of secret-bearing keys.
+    
+    Returns:
+        Any: The cleaned value with secret keys removed, preserving the input's structure types.
+    """
     if isinstance(value, dict):
         cleaned: Dict[str, Any] = {}
         for key, item in value.items():
@@ -71,7 +97,17 @@ def _without_secrets(value: Any) -> Any:
 
 
 def save_config(config: Dict[str, Any]) -> bool:
-    """Save non-secret configuration to config file."""
+    """
+    Write the provided configuration to the project's config.json after removing secret keys.
+    
+    The file is written to the repository-level config.json (Path(__file__).parent.parent / "config.json"). Secret-bearing keys (case-insensitive matches against SECRET_KEYS) are removed from the data before it is persisted.
+    
+    Parameters:
+        config (Dict[str, Any]): Configuration mapping to save; secret fields will be stripped before writing.
+    
+    Returns:
+        bool: `True` if the file was written successfully, `False` otherwise.
+    """
     config_path = Path(__file__).parent.parent / "config.json"
     
     try:

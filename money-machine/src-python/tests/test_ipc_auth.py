@@ -59,6 +59,22 @@ async def _send_raw(host: str, port: int, raw: bytes) -> dict:
 async def _start_server(
     rate: float = 100.0, burst: float = 200.0, read_timeout_seconds: float = 5.0
 ) -> Tuple[IPCServer, asyncio.Task, Tuple[str, int]]:
+    """
+    Start a test IPCServer bound to an ephemeral loopback port and return the server instance, the background serve task, and the resolved (host, port) address.
+    
+    The server is configured for tests (uses the module's `_echo_handler` and `TEST_TOKEN`) and is started in a background task; the function waits until the server socket is bound before returning.
+    
+    Parameters:
+        rate (float): Token refill rate (tokens per second) for the server's rate limiter.
+        burst (float): Burst capacity (maximum tokens) for the server's rate limiter.
+        read_timeout_seconds (float): Number of seconds the server will wait for a request body before timing out.
+    
+    Returns:
+        Tuple[IPCServer, asyncio.Task, Tuple[str, int]]: A tuple containing
+            - the started IPCServer instance,
+            - the asyncio.Task running the server's serve loop,
+            - a (host, port) tuple for the bound ephemeral endpoint.
+    """
     server = IPCServer(
         command_handler=_echo_handler,
         host="127.0.0.1",
@@ -189,6 +205,11 @@ def test_missing_token_returns_401() -> None:
 
 
 def test_rate_limit_returns_429_after_burst() -> None:
+    """
+    Verifies the server enforces the configured token-bucket rate limit by allowing requests up to the burst size and returning a 429 error once the burst is exhausted.
+    
+    The test sends multiple authenticated requests: the first N requests (where N equals the burst limit) must succeed, and the subsequent request must receive a response with code 429 and an error message referencing rate limiting.
+    """
     async def scenario() -> None:
         # Tiny bucket so we can exhaust it in a handful of requests.
         server, task, (host, port) = await _start_server(rate=1.0, burst=3.0)
@@ -212,6 +233,11 @@ def test_rate_limit_returns_429_after_burst() -> None:
 
 
 def test_oversized_ipc_body_returns_413() -> None:
+    """
+    Verifies the IPC server returns a 413 error when the request body exceeds IPCServer.MAX_BODY_BYTES.
+    
+    Sends an authenticated request whose JSON body is one byte larger than MAX_BODY_BYTES and asserts the server responds with code 413.
+    """
     async def scenario() -> None:
         server, task, (host, port) = await _start_server()
         try:
@@ -226,6 +252,11 @@ def test_oversized_ipc_body_returns_413() -> None:
 
 
 def test_missing_body_times_out() -> None:
+    """
+    Verifies the IPC server responds with code 408 when the request body is not received before the read timeout.
+    
+    Starts an IPCServer with a short read timeout, sends only the authentication header (no JSON body), and asserts the server returns `code == 408`.
+    """
     async def scenario() -> None:
         server, task, (host, port) = await _start_server(read_timeout_seconds=0.05)
         try:

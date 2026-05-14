@@ -742,7 +742,16 @@ class MT5Adapter(ExecutionAdapter):
         request: OrderRequest,
         response: HttpResponse,
     ) -> OrderResult:
-        """Turn an HTTP response from the Worker into an OrderResult."""
+        """
+        Map an HTTP response from the relay Worker to an OrderResult representing the placement outcome.
+        
+        Parameters:
+            request (OrderRequest): Original order request used to populate client-facing fields.
+            response (HttpResponse): HTTP response returned by the relay Worker.
+        
+        Returns:
+            OrderResult: If the response status is 2xx, returns a `PENDING` result whose `venue_order_id` is taken directly from the parsed JSON `venue_order_id` field (may be missing or empty) and whose `metadata["relay_response"]` contains the parsed JSON dict. For non-2xx responses, returns a `REJECTED` result with `error` set to "relay HTTP {status}: {body_text}" where `body_text` is the response body decoded as UTF-8 with replacement and truncated to 256 bytes.
+        """
         if 200 <= response.status < 300:
             parsed = _safe_parse_json_dict(response.body)
             venue_id = parsed.get("venue_order_id")

@@ -8,6 +8,14 @@ import { ControlPanel } from '@/components/ControlPanel';
 import { TradesTable } from '@/components/TradesTable';
 import { useEnginePolling } from '@/hooks/useEnginePolling';
 
+/**
+ * Render the main dashboard UI for the Money Machine application.
+ *
+ * Initializes engine polling with a 5000ms interval and composes the header, metrics
+ * panels, control and status widgets, trades and PnL sections, and footer.
+ *
+ * @returns The React element for the application's main dashboard interface.
+ */
 export default function Dashboard() {
   useEnginePolling(5000);
   return (

@@ -34,7 +34,12 @@ export interface ShadowReport {
 export const isTauri = typeof window !== 'undefined' && '__TAURI__' in window;
 
 /**
- * Send IPC command to Python engine via TCP
+ * Sends an IPC command to the backend, using the native Tauri bridge when available or an HTTP development proxy otherwise.
+ *
+ * @param command - Command name to send (will be lowercased for the Tauri bridge)
+ * @param payload - Command-specific payload
+ * @returns The backend response parsed as type `T`
+ * @throws Error when the development proxy responds with an `error` field
  */
 async function sendIPCCommand<T>(command: string, payload: Record<string, unknown> = {}): Promise<T> {
     if (isTauri) {
@@ -77,6 +82,11 @@ export async function getStatus(): Promise<EngineStatus> {
     return await sendIPCCommand<EngineStatus>('GET_STATUS');
 }
 
+/**
+ * Checks whether the backend responds to a ping request.
+ *
+ * @returns `true` if the backend responded with `'pong'`, `false` otherwise (including when an error occurs)
+ */
 export async function ping(): Promise<boolean> {
     try {
         const result = await sendIPCCommand<{ status: string }>('PING');
@@ -86,6 +96,13 @@ export async function ping(): Promise<boolean> {
     }
 }
 
+/**
+ * Execute a named skill on the backend engine with optional parameters.
+ *
+ * @param skillName - The identifier of the skill to execute
+ * @param params - Optional key/value parameters passed to the skill
+ * @returns The raw response returned by the backend engine
+ */
 export async function executeSkill(skillName: string, params: Record<string, unknown> = {}): Promise<unknown> {
     return await sendIPCCommand('EXECUTE_SKILL', { skill: skillName, params });
 }

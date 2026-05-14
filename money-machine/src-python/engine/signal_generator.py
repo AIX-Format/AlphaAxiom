@@ -177,7 +177,14 @@ Generate a trading signal based on this data."""
         response_text: str,
         market_data: List[List]
     ) -> TradingSignal:
-        """Parse JSON response into a TradingSignal"""
+        """
+        Convert a Gemini JSON response string into a TradingSignal for the given symbol.
+        
+        Parses `response_text` as JSON and maps fields into a `TradingSignal`. If `entry_price` is missing or falsy, the last candle close from `market_data` is used as the entry price. The parsed `amount_pct` is placed under `metadata["amount_pct"]`. On JSON parsing or value errors, returns a fallback `TradingSignal` with `action='HOLD'`, `confidence=0.3`, and a reasoning message indicating a parsing failure.
+        
+        Returns:
+            TradingSignal: The signal built from the parsed JSON or the fallback HOLD signal on error.
+        """
         try:
             data = json.loads(response_text)
             

@@ -103,6 +103,19 @@ use std::sync::Mutex;
 
 static KEEP_AWAKE_HANDLE: Lazy<Mutex<Option<KeepAwake>>> = Lazy::new(|| Mutex::new(None));
 
+/// Enables the OS keep-alive handle to prevent system idle and sleep for the application.
+///
+/// If a keep-alive handle is already active this returns `Ok("Keep-Alive already active")`.
+/// On success it returns `Ok("Keep-Alive enabled")`. On failure it returns `Err` with a string describing the error (mutex lock failure or keep-awake creation failure).
+///
+/// # Examples
+///
+/// ```
+/// // Call and check that a keep-alive response was returned.
+/// let res = enable_keep_alive();
+/// assert!(res.is_ok());
+/// assert!(res.unwrap().contains("Keep-Alive"));
+/// ```
 #[tauri::command]
 fn enable_keep_alive() -> Result<String, String> {
     let mut handle = KEEP_AWAKE_HANDLE.lock().map_err(|e| e.to_string())?;
