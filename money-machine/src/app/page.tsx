@@ -5,8 +5,10 @@ import { PnLWidget } from '@/components/PnLWidget';
 import { StatusWidget } from '@/components/StatusWidget';
 import { ControlPanel } from '@/components/ControlPanel';
 import { TradesTable } from '@/components/TradesTable';
+import { useEnginePolling } from '@/hooks/useEnginePolling';
 
 export default function Dashboard() {
+  useEnginePolling(5000);
   return (
     <div className="min-h-screen bg-[var(--bg-primary)] p-6">
       {/* Header */}

@@ -4,7 +4,7 @@ import { motion } from 'framer-motion';
 import { useAppStore } from '@/store/useAppStore';
 
 export function StatusWidget() {
-    const { connected, tradingActive, skillsLoaded, uptime } = useAppStore();
+    const { connected, tradingActive, skillsLoaded, uptime, shadowReport } = useAppStore();
 
     const formatUptime = (seconds: number) => {
         const hours = Math.floor(seconds / 3600);
@@ -56,6 +56,27 @@ export function StatusWidget() {
                 <div className="flex items-center justify-between">
                     <span className="text-[var(--text-muted)]">Uptime</span>
                     <span className="text-[var(--text-secondary)]">{formatUptime(uptime)}</span>
+                </div>
+
+                <div className="pt-2 border-t border-white/10">
+                    <div className="flex items-center justify-between">
+                        <span className="text-[var(--text-muted)]">Shadow Drift</span>
+                        <span className="text-[var(--text-secondary)]">
+                            {(shadowReport.drift_rate * 100).toFixed(2)}%
+                        </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                        <span className="text-[var(--text-muted)]">Shadow Errors</span>
+                        <span className="text-[var(--text-secondary)]">
+                            {(shadowReport.error_rate * 100).toFixed(2)}%
+                        </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                        <span className="text-[var(--text-muted)]">Acceptance</span>
+                        <span className={shadowReport.accepted ? 'text-[var(--profit-green)]' : 'text-[var(--loss-red)]'}>
+                            {shadowReport.accepted ? 'Pass' : 'Pending'}
+                        </span>
+                    </div>
                 </div>
             </div>
         </motion.div>

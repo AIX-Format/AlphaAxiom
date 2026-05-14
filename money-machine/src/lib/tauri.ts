@@ -21,6 +21,15 @@ export interface EngineStatus {
     ai_enabled?: boolean;
 }
 
+export interface ShadowReport {
+    window_minutes: number;
+    compared: number;
+    drift_rate: number;
+    error_rate: number;
+    match_rate?: number;
+    accepted: boolean;
+}
+
 // Check if running in Tauri
 export const isTauri = typeof window !== 'undefined' && '__TAURI__' in window;
 
@@ -79,6 +88,10 @@ export async function ping(): Promise<boolean> {
 
 export async function executeSkill(skillName: string, params: Record<string, any> = {}): Promise<any> {
     return await sendIPCCommand('EXECUTE_SKILL', { skill: skillName, params });
+}
+
+export async function getShadowReport(windowMinutes: number = 60): Promise<ShadowReport> {
+    return await sendIPCCommand<ShadowReport>('GET_SHADOW_REPORT', { window_minutes: windowMinutes });
 }
 
 // ============================================================

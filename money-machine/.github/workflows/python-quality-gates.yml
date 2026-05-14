@@ -1,0 +1,121 @@
+name: Money Machine Python Quality Gates
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'money-machine/src-python/**'
+      - 'money-machine/.github/workflows/python-quality-gates.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'money-machine/src-python/**'
+      - 'money-machine/.github/workflows/python-quality-gates.yml'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  python-quality:
+    name: Lint, Type, Format, Unit Coverage, Integration Coverage
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: money-machine/src-python
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: money-machine/src-python/requirements.txt
+
+      - name: Install runtime + QA tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff black mypy pytest pytest-cov
+
+      - name: Ruff lint gate
+        run: ruff check .
+
+      - name: Black format gate
+        run: black --check .
+
+      - name: Mypy type gate
+        run: mypy .
+
+      - name: Unit tests + coverage gate (core >= 70%)
+        run: |
+          pytest tests \
+            --ignore=tests/test_signal_flow.py \
+            --ignore=tests/test_market_data.py \
+            --ignore=tests/test_backtest.py \
+            --cov=engine \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage-unit.xml \
+            --cov-fail-under=70
+
+      - name: Integration tests + coverage report
+        run: |
+          pytest \
+            tests/test_signal_flow.py \
+            tests/test_market_data.py \
+            tests/test_backtest.py \
+            --cov=engine \
+            --cov-append \
+            --cov-report=xml:coverage-integration.xml
+
+      - name: Combined coverage summary
+        run: |
+          pytest tests \
+            --cov=engine \
+            --cov-report=term \
+            --cov-report=xml:coverage-total.xml \
+            > coverage-summary.txt
+          python - <<'PY'
+          import pathlib
+          report = pathlib.Path('coverage-summary.txt').read_text()
+          lines = [line for line in report.splitlines() if line.strip().startswith('TOTAL')]
+          total = lines[-1] if lines else 'TOTAL not found'
+          pathlib.Path('quality-summary.md').write_text(
+              '\n'.join([
+                  '# Money Machine Python Quality Summary',
+                  '',
+                  '- ✅ Lint: `ruff check .`',
+                  '- ✅ Format: `black --check .`',
+                  '- ✅ Type check: `mypy .`',
+                  '- ✅ Unit coverage gate (engine): **>= 70%**',
+                  '- ✅ Integration suite executed',
+                  '',
+                  '## Coverage',
+                  '',
+                  '```text',
+                  total,
+                  '```',
+              ])
+          )
+          PY
+
+      - name: Upload quality artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: money-machine-python-quality
+          path: |
+            money-machine/src-python/quality-summary.md
+            money-machine/src-python/coverage-summary.txt
+            money-machine/src-python/coverage-unit.xml
+            money-machine/src-python/coverage-integration.xml
+            money-machine/src-python/coverage-total.xml
+
+      - name: Add PR quality comment
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: money-machine-python-quality
+          path: money-machine/src-python/quality-summary.md
