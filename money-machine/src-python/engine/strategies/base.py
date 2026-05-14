@@ -51,7 +51,6 @@ class TradingSignal:
     entry_price: Optional[float] = None
     stop_loss: Optional[float] = None
     take_profit: Optional[float] = None
-    amount: Optional[float] = None
     reasoning: str = ""
     timestamp: float = 0.0
     metadata: Dict[str, Any] = field(default_factory=dict)

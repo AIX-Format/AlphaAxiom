@@ -1,7 +1,7 @@
 {
   "name": "money-machine",
-  "version": "0.1.0",
-  "homepage": "https://aitrading.axiomid.app",
+  "version": "0.1.1-alpha",
+  "homepage": "https://aqt.axiomid.app",
   "repository": {
     "type": "git",
     "url": "https://github.com/Moeabdelaziz007/AlphaAxiom.git",
@@ -41,7 +41,7 @@
     "@types/node": "^25",
     "@types/react": "^19",
     "@types/react-dom": "^19",
-    "eslint": "^10",
+    "eslint": "^9",
     "eslint-config-next": "16.2.6",
     "tailwindcss": "^4",
     "typescript": "^6"

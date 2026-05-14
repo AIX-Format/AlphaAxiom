@@ -190,8 +190,8 @@ Generate a trading signal based on this data."""
                 entry_price=data.get('entry_price') or current_price,
                 stop_loss=data.get('stop_loss'),
                 take_profit=data.get('take_profit'),
-                amount=data.get('amount_pct'),
-                reasoning=data.get('reasoning', '')
+                reasoning=data.get('reasoning', ''),
+                metadata={"amount_pct": data.get("amount_pct")},
             )
         except (json.JSONDecodeError, KeyError, ValueError) as e:
             logger.warning(f"Failed to parse Gemini response: {e}. Raw: {response_text[:100]}...")

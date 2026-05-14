@@ -6,7 +6,7 @@
         "frontendDist": "../out"
     },
     "productName": "money-machine",
-    "version": "0.1.0",
+    "version": "0.1.1-alpha",
     "identifier": "com.antigravity.moneymachine",
     "app": {
         "windows": [
