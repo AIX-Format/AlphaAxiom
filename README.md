@@ -55,7 +55,7 @@
 
 <p align="center">
   <a href="https://t.me/AlphaAxiomBot">🤖 Telegram Bot</a> •
-  <a href="https://aqt.axiomid.app">🌐 Dashboard</a> •
+  <a href="https://aitrading.axiomid.app">🌐 Dashboard</a> •
   <a href="https://oracle.axiomid.app">⚡ Oracle API</a> •
   <a href="https://github.com/Moeabdelaziz007/AlphaAxiom/releases">📦 Downloads</a>
 </p>
@@ -77,7 +77,7 @@
 | المنتج | الوصف | الرابط |
 |--------|-------|--------|
 | 🤖 **Telegram Bot** | تنبيهات فورية + أوامر التداول | [@AlphaAxiomBot](https://t.me/AlphaAxiomBot) |
-| 🌐 **Dashboard** | لوحة تحكم الويب | [aqt.axiomid.app](https://aqt.axiomid.app) |
+| 🌐 **Dashboard** | لوحة تحكم الويب | [aitrading.axiomid.app](https://aitrading.axiomid.app) |
 | 💻 **Money Machine** | تطبيق سطح المكتب (Ghost/Overlay) | [تحميل](https://github.com/Moeabdelaziz007/AlphaAxiom/releases) |
 | 📊 **AlphaReceiver.mq5** | EA لتنفيذ الصفقات على MT5 | [تحميل](https://github.com/Moeabdelaziz007/AlphaAxiom/tree/main/frontend/public) |
 
@@ -134,7 +134,7 @@
 | Product | Description | Link |
 |---------|-------------|------|
 | 🤖 **Telegram Bot** | Instant alerts + Trading commands | [@AlphaAxiomBot](https://t.me/AlphaAxiomBot) |
-| 🌐 **Dashboard** | Web-based control panel | [aqt.axiomid.app](https://aqt.axiomid.app) |
+| 🌐 **Dashboard** | Web-based control panel | [aitrading.axiomid.app](https://aitrading.axiomid.app) |
 | 💻 **Money Machine** | Desktop overlay app (Ghost Mode) | [Download](https://github.com/Moeabdelaziz007/AlphaAxiom/releases) |
 | 📊 **AlphaReceiver.mq5** | MT5 Expert Advisor for trade execution | [Download](https://github.com/Moeabdelaziz007/AlphaAxiom/tree/main/frontend/public) |
 
@@ -208,7 +208,7 @@ npm run tauri dev
 ├─────────────────────────────────────────────────────────────────┤
 │   📡 DELIVERY CHANNELS                                          │
 │   ├── Telegram Bot (@AlphaAxiomBot)                             │
-│   ├── Web Dashboard (aqt.axiomid.app)                           │
+│   ├── Web Dashboard (aitrading.axiomid.app)                     │
 │   ├── Desktop App (Money Machine)                               │
 │   └── Oracle API (oracle.axiomid.app)                           │
 ├─────────────────────────────────────────────────────────────────┤
@@ -226,7 +226,7 @@ npm run tauri dev
 | Resource | URL |
 |----------|-----|
 | 🤖 Telegram Bot | [t.me/AlphaAxiomBot](https://t.me/AlphaAxiomBot) |
-| 🌐 Dashboard | [aqt.axiomid.app](https://aqt.axiomid.app) |
+| 🌐 Dashboard | [aitrading.axiomid.app](https://aitrading.axiomid.app) |
 | ⚡ Oracle API | [oracle.axiomid.app](https://oracle.axiomid.app) |
 | 📦 Releases | [GitHub Releases](https://github.com/Moeabdelaziz007/AlphaAxiom/releases) |
 | 📊 EA Download | [AlphaReceiver.mq5](https://github.com/Moeabdelaziz007/AlphaAxiom/tree/main/frontend/public) |

@@ -206,7 +206,8 @@ class MoneyMachineApp:
     def _record_shadow_decision(self, symbol: str, signal: dict) -> None:
         """Store dry-run decision and compare against baseline strategy."""
         balance = float(self.engine.portfolio.get_balance())
-        risk_pct = float(signal.get("amount") or 0.0)
+        metadata = signal.get("metadata") or {}
+        risk_pct = float(metadata.get("amount_pct") or 0.0)
         size = balance * risk_pct
         decision = ShadowDecision(
             timestamp=float(signal.get("timestamp", 0.0)) or self.engine.get_server_time(),

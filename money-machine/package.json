@@ -1,6 +1,6 @@
 {
   "name": "money-machine",
-  "version": "0.1.0",
+  "version": "0.1.1-alpha",
   "homepage": "https://aqt.axiomid.app",
   "repository": {
     "type": "git",
@@ -24,7 +24,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "tauri": "tauri"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.0",
@@ -36,12 +37,16 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
+    "@tauri-apps/cli": "^2.11.1",
     "@types/node": "^25",
     "@types/react": "^19",
     "@types/react-dom": "^19",
-    "eslint": "^10",
+    "eslint": "^9",
     "eslint-config-next": "16.2.6",
     "tailwindcss": "^4",
     "typescript": "^6"
+  },
+  "overrides": {
+    "postcss": "^8.5.14"
   }
 }

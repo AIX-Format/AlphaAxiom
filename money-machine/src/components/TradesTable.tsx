@@ -6,12 +6,7 @@ import { useAppStore, Trade } from '@/store/useAppStore';
 export function TradesTable() {
     const { trades } = useAppStore();
 
-    // Mock data for demo
-    const demoTrades: Trade[] = trades.length > 0 ? trades : [
-        { id: '1', symbol: 'BTC/USDT', side: 'buy', amount: 0.05, price: 42350, pnl: 120.50, timestamp: Date.now() - 3600000 },
-        { id: '2', symbol: 'ETH/USDT', side: 'sell', amount: 1.2, price: 2245, pnl: -45.20, timestamp: Date.now() - 7200000 },
-        { id: '3', symbol: 'BTC/USDT', side: 'buy', amount: 0.03, price: 42100, pnl: 85.00, timestamp: Date.now() - 10800000 },
-    ];
+    const recentTrades: Trade[] = trades;
 
     const formatTime = (timestamp: number) => {
         return new Date(timestamp).toLocaleTimeString('en-US', {
@@ -36,13 +31,19 @@ export function TradesTable() {
                 </span>
             </div>
 
-            {demoTrades.length === 0 ? (
-                <div className="py-12 text-center text-[var(--text-muted)]">
-                    No trades yet
+            {recentTrades.length === 0 ? (
+                <div className="rounded-xl border border-dashed border-white/10 bg-white/[0.02] px-6 py-12 text-center">
+                    <div className="mx-auto mb-3 grid h-12 w-12 place-items-center rounded-2xl bg-[var(--profit-green)]/10 text-[var(--profit-green)]">
+                        S
+                    </div>
+                    <div className="font-medium text-[var(--text-secondary)]">Shadow mode is waiting for verified signals</div>
+                    <div className="mt-1 text-xs text-[var(--text-muted)]">
+                        No live or simulated trades are shown until the engine reports real data.
+                    </div>
                 </div>
             ) : (
                 <div className="space-y-3">
-                    {demoTrades.map((trade, index) => (
+                    {recentTrades.map((trade, index) => (
                         <motion.div
                             key={trade.id}
                             initial={{ opacity: 0, x: -20 }}

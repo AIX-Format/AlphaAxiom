@@ -97,7 +97,7 @@ fn set_always_on_top(window: tauri::WebviewWindow, state: bool) {
 // OS KEEP-ALIVE (Prevent system sleep during trading)
 // ============================================================
 
-use keepawake::KeepAwake;
+use keepawake::{Builder as KeepAwakeBuilder, KeepAwake};
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
 
@@ -111,11 +111,15 @@ fn enable_keep_alive() -> Result<String, String> {
         return Ok("Keep-Alive already active".to_string());
     }
 
-    let awake = KeepAwake::new()
-        .map_err(|e| format!("Failed to enable Keep-Alive: {}", e))?
+    let awake = KeepAwakeBuilder::default()
         .display(false) // Keep display on (optional)
         .idle(true) // Prevent idle sleep
-        .sleep(true); // Prevent sleep
+        .sleep(true) // Prevent sleep
+        .reason("Money Machine trading session")
+        .app_name("Money Machine")
+        .app_reverse_domain("com.antigravity.moneymachine")
+        .create()
+        .map_err(|e| format!("Failed to enable Keep-Alive: {}", e))?;
 
     *handle = Some(awake);
     log::info!("✅ OS Keep-Alive enabled");

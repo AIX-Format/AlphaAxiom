@@ -7,6 +7,12 @@ from datetime import date, datetime, timezone
 from typing import Dict, List, Optional, Any
 import os
 
+CONFIG_LIMITS = {
+    "initial_balance": (100.0, 1_000_000.0, False),
+    "max_risk_per_trade": (0.0, 0.1, True),
+    "max_daily_loss": (0.0, 0.2, True),
+}
+
 
 class Portfolio:
     """Manages portfolio state, balance, and positions.
@@ -180,10 +186,29 @@ class TradingEngine:
         return (datetime.now() - self.start_time).total_seconds()
     
     async def update_config(self, new_config: dict):
-        """Update configuration on the fly"""
-        self.config.update(new_config)
+        """Update safe runtime configuration on the fly."""
+        self.config.update(validate_config_update(new_config))
     
     async def close(self):
         """Cleanup resources"""
         if self.exchange:
             await self.exchange.close()
+
+
+def validate_config_update(new_config: dict) -> dict:
+    if not isinstance(new_config, dict):
+        raise ValueError("config update must be an object")
+    validated: dict = {}
+    for key, raw_value in new_config.items():
+        if key not in CONFIG_LIMITS:
+            raise ValueError(f"unsupported config.{key}")
+        if not isinstance(raw_value, (int, float)) or isinstance(raw_value, bool):
+            raise ValueError(f"config.{key} must be numeric")
+
+        value = float(raw_value)
+        minimum, maximum, exclusive_minimum = CONFIG_LIMITS[key]
+        above_minimum = value > minimum if exclusive_minimum else value >= minimum
+        if not above_minimum or value > maximum:
+            raise ValueError(f"config.{key} is outside allowed range")
+        validated[key] = value
+    return validated

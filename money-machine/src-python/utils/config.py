@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Dict, Any
 
+SECRET_KEYS = frozenset({"api_key", "secret", "gemini_api_key"})
+
 
 def load_config() -> Dict[str, Any]:
     """Load configuration from environment variables and config file"""
@@ -39,20 +41,42 @@ def load_config() -> Dict[str, Any]:
         try:
             with open(config_path, 'r') as f:
                 file_config = json.load(f)
-                config.update(file_config)
+                _deep_merge(config, _without_secrets(file_config))
         except Exception as e:
             print(f"Warning: Could not load config file: {e}")
     
     return config
 
 
+def _deep_merge(base: Dict[str, Any], update: Dict[str, Any]) -> None:
+    for key, value in update.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = value
+
+
+def _without_secrets(value: Any) -> Any:
+    """Return a copy with secret-bearing keys removed before disk use."""
+    if isinstance(value, dict):
+        cleaned: Dict[str, Any] = {}
+        for key, item in value.items():
+            if key.lower() in SECRET_KEYS:
+                continue
+            cleaned[key] = _without_secrets(item)
+        return cleaned
+    if isinstance(value, list):
+        return [_without_secrets(item) for item in value]
+    return value
+
+
 def save_config(config: Dict[str, Any]) -> bool:
-    """Save configuration to config file"""
+    """Save non-secret configuration to config file."""
     config_path = Path(__file__).parent.parent / "config.json"
     
     try:
         with open(config_path, 'w') as f:
-            json.dump(config, f, indent=2)
+            json.dump(_without_secrets(config), f, indent=2)
         return True
     except Exception as e:
         print(f"Error saving config: {e}")
