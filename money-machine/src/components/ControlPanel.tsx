@@ -10,6 +10,7 @@ export function ControlPanel() {
     const [loading, setLoading] = useState(false);
     const [isAlwaysOnTop, setIsAlwaysOnTop] = useState(true);
     const [isGhostMode, setIsGhostMode] = useState(false);
+    const tradingLabel = tradingActive ? 'Pause Shadow Trading' : 'Start Shadow Trading';
 
     const handleToggleTrading = async () => {
         if (!connected) return;
@@ -43,18 +44,19 @@ export function ControlPanel() {
     };
 
     return (
-        <motion.div
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.5, delay: 0.2 }}
-            className="glass-card p-6"
-        >
+        <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5, delay: 0.2 }} className="glass-card p-6">
             <h3 className="text-sm font-medium text-[var(--text-secondary)] mb-4 flex justify-between items-center">
-                <span>Control Panel</span>
-                <span className={`text-[10px] px-2 py-0.5 rounded-full ${connected ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
-                    {connected ? 'CONNECTED' : 'OFFLINE'}
+                <span>Mission Control</span>
+                <span className={`status-pill ${connected ? 'status-pill-online' : 'status-pill-offline'}`}>
+                    {connected ? 'ENGINE LIVE' : 'ENGINE OFFLINE'}
                 </span>
             </h3>
+
+            {!connected && (
+                <div className="mb-4 rounded-xl border border-amber-400/20 bg-amber-400/10 p-3 text-xs text-amber-100">
+                    Shadow dashboard is ready. Start the Python engine to unlock live controls.
+                </div>
+            )}
 
             <div className="space-y-4">
                 {/* Main Trading Button */}
@@ -71,11 +73,14 @@ export function ControlPanel() {
                             Processing...
                         </span>
                     ) : tradingActive ? (
-                        '⏸ Stop Trading'
+                        'Pause Shadow Trading'
                     ) : (
-                        '▶ Start Trading'
+                        'Start Shadow Trading'
                     )}
                 </button>
+                <div className="rounded-xl border border-[var(--accent-blue)]/20 bg-[var(--accent-blue)]/10 px-3 py-2 text-xs text-[var(--text-secondary)]">
+                    {tradingLabel} only toggles supervised shadow mode until a reviewed live adapter is connected.
+                </div>
 
                 {/* Window Controls (Wispr Flow) */}
                 <div className="grid grid-cols-2 gap-3">
@@ -84,7 +89,7 @@ export function ControlPanel() {
                         className={`glass-card-subtle py-2 px-3 text-xs font-medium transition-colors flex items-center justify-center gap-2 ${isAlwaysOnTop ? 'text-[var(--profit-green)] bg-[var(--profit-green)]/10' : 'text-[var(--text-secondary)]'
                             }`}
                     >
-                        📌 {isAlwaysOnTop ? 'On Top' : 'Floating'}
+                        {isAlwaysOnTop ? 'Pinned' : 'Floating'}
                     </button>
                     <button
                         onClick={toggleGhostMode}
@@ -92,17 +97,17 @@ export function ControlPanel() {
                         className={`glass-card-subtle py-2 px-3 text-xs font-medium transition-colors flex items-center justify-center gap-2 ${isGhostMode ? 'text-[var(--accent-blue)] bg-[var(--accent-blue)]/10' : 'text-[var(--text-secondary)]'
                             }`}
                     >
-                        👻 {isGhostMode ? 'Ghost' : 'Interactive'}
+                        {isGhostMode ? 'Ghost' : 'Interactive'}
                     </button>
                 </div>
 
                 {/* Quick Actions */}
                 <div className="grid grid-cols-2 gap-3">
                     <button disabled={!connected} className="glass-card-subtle py-3 px-4 text-sm hover:bg-white/5 disabled:opacity-50 text-[var(--text-secondary)]">
-                        📊 History
+                        History
                     </button>
                     <button disabled={!connected} className="glass-card-subtle py-3 px-4 text-sm hover:bg-white/5 disabled:opacity-50 text-[var(--text-secondary)]">
-                        ⚙️ Config
+                        Config
                     </button>
                 </div>
             </div>

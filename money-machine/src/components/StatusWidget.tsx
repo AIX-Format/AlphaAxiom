@@ -13,12 +13,7 @@ export function StatusWidget() {
     };
 
     return (
-        <motion.div
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.5, delay: 0.1 }}
-            className="glass-card p-6"
-        >
+        <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5, delay: 0.1 }} className="glass-card p-6">
             <h3 className="text-sm font-medium text-[var(--text-secondary)] mb-4">
                 Engine Status
             </h3>
@@ -59,6 +54,10 @@ export function StatusWidget() {
                 </div>
 
                 <div className="pt-2 border-t border-white/10">
+                    <div className="mb-3 flex items-center justify-between rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2">
+                        <span className="text-[var(--text-muted)]">Oracle</span>
+                        <span className="text-[var(--accent-blue)]">oracle.axiomid.app</span>
+                    </div>
                     <div className="flex items-center justify-between">
                         <span className="text-[var(--text-muted)]">Shadow Drift</span>
                         <span className="text-[var(--text-secondary)]">

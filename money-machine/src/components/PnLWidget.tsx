@@ -40,6 +40,10 @@ export function PnLWidget() {
                     <span className="text-[var(--text-muted)]">Balance: </span>
                     <span className="font-medium">${portfolio.balance.toFixed(2)}</span>
                 </div>
+                <div>
+                    <span className="text-[var(--text-muted)]">Mode: </span>
+                    <span className="font-medium text-[var(--accent-blue)]">Shadow</span>
+                </div>
             </div>
         </motion.div>
     );

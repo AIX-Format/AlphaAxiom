@@ -8,7 +8,7 @@ import { invoke } from '@tauri-apps/api/core';
 // Types
 export interface PortfolioData {
     balance: number;
-    positions: Record<string, any>;
+    positions: Record<string, unknown>;
     pnl: number;
     timestamp: number;
 }
@@ -36,7 +36,7 @@ export const isTauri = typeof window !== 'undefined' && '__TAURI__' in window;
 /**
  * Send IPC command to Python engine via TCP
  */
-async function sendIPCCommand<T>(command: string, payload: Record<string, any> = {}): Promise<T> {
+async function sendIPCCommand<T>(command: string, payload: Record<string, unknown> = {}): Promise<T> {
     if (isTauri) {
         return await invoke(command.toLowerCase(), payload);
     }
@@ -86,7 +86,7 @@ export async function ping(): Promise<boolean> {
     }
 }
 
-export async function executeSkill(skillName: string, params: Record<string, any> = {}): Promise<any> {
+export async function executeSkill(skillName: string, params: Record<string, unknown> = {}): Promise<unknown> {
     return await sendIPCCommand('EXECUTE_SKILL', { skill: skillName, params });
 }
 
