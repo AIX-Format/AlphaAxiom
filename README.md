@@ -333,7 +333,7 @@ MIT License - See [LICENSE](LICENSE) for details.
 ---
 
 <p align="center">
-  Made with 💜 in Egypt 🇪🇬<br>
+  Made with 💜 built by agent for agentic era. <br>
   <em>Part of the Axiom Ecosystem</em>
 </p>
 
