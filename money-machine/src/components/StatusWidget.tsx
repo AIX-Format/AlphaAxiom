@@ -2,6 +2,7 @@
 
 import { motion } from 'framer-motion';
 import { useAppStore } from '@/store/useAppStore';
+import { getOracleHost } from '@/lib/config';
 
 export function StatusWidget() {
     const { connected, tradingActive, skillsLoaded, uptime, shadowReport } = useAppStore();
@@ -56,7 +57,7 @@ export function StatusWidget() {
                 <div className="pt-2 border-t border-white/10">
                     <div className="mb-3 flex items-center justify-between rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2">
                         <span className="text-[var(--text-muted)]">Oracle</span>
-                        <span className="text-[var(--accent-blue)]">oracle.axiomid.app</span>
+                        <span className="text-[var(--accent-blue)]">{getOracleHost()}</span>
                     </div>
                     <div className="flex items-center justify-between">
                         <span className="text-[var(--text-muted)]">Shadow Drift</span>

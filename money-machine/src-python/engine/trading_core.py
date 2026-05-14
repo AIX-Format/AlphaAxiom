@@ -8,7 +8,6 @@ from typing import Dict, List, Optional, Any
 import os
 
 CONFIG_LIMITS = {
-    "initial_balance": (100.0, 1_000_000.0, False),
     "max_risk_per_trade": (0.0, 0.1, True),
     "max_daily_loss": (0.0, 0.2, True),
 }
