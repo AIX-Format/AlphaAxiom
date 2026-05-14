@@ -237,6 +237,53 @@ def test_missing_body_times_out() -> None:
     _run(scenario())
 
 
+def test_oversized_auth_header_returns_413() -> None:
+    async def scenario() -> None:
+        server, task, (host, port) = await _start_server()
+        try:
+            # Craft an auth header line that exceeds MAX_AUTH_LINE_BYTES.
+            oversized_token = "x" * (IPCServer.MAX_AUTH_LINE_BYTES + 1)
+            auth_line = f"X-Auth-Token: {oversized_token}\n".encode("utf-8")
+            response = await _send_raw(host, port, auth_line)
+            assert response.get("code") == 413, response
+        finally:
+            await _shutdown(server, task)
+
+    _run(scenario())
+
+
+def test_invalid_json_body_returns_400() -> None:
+    async def scenario() -> None:
+        server, task, (host, port) = await _start_server()
+        try:
+            # Valid auth header but the body is not parseable JSON.
+            wire = f"X-Auth-Token: {TEST_TOKEN}\nnot valid json at all\n".encode("utf-8")
+            response = await _send_raw(host, port, wire)
+            assert response.get("code") == 400, response
+            assert "json" in response.get("error", "").lower()
+        finally:
+            await _shutdown(server, task)
+
+    _run(scenario())
+
+
+def test_missing_command_field_returns_400() -> None:
+    async def scenario() -> None:
+        server, task, (host, port) = await _start_server()
+        try:
+            # Valid auth, valid JSON body, but no "command" key.
+            import json as _json
+            body = _json.dumps({"payload": {"hello": "world"}})
+            wire = f"X-Auth-Token: {TEST_TOKEN}\n{body}\n".encode("utf-8")
+            response = await _send_raw(host, port, wire)
+            assert response.get("code") == 400, response
+            assert "command" in response.get("error", "").lower()
+        finally:
+            await _shutdown(server, task)
+
+    _run(scenario())
+
+
 if __name__ == "__main__":
     # Allow running this file directly: `python tests/test_ipc_auth.py`.
     import traceback
