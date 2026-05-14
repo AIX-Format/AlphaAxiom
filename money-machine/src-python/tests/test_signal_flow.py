@@ -838,3 +838,155 @@ def test_drawdown_trip_via_pipeline_flow() -> None:
     assert result.risk_decision.reason == RejectionReason.MAX_DRAWDOWN
     assert shield.is_emergency_stop_active() is True
     assert engine.received == []
+
+
+# ---------------------------------------------------------------------------
+# ContractValidator removal regression tests (PR: ContractValidator.signal()
+# calls removed from signal_pipeline.py both in the happy path and the
+# fallback path after a strategy exception).
+#
+# These tests verify that the pipeline continues to function correctly
+# without the now-removed validation layer, and that the fallback signal
+# is correctly constructed.
+# ---------------------------------------------------------------------------
+
+
+def test_fallback_signal_carries_strategy_symbol() -> None:
+    """When a strategy raises, the synthetic HOLD fallback must carry the
+    strategy's symbol, not an empty string.
+
+    Regression guard for the ContractValidator removal: previously the
+    fallback signal was validated by ContractValidator.signal() after
+    creation. After the removal the fallback still must have a coherent
+    symbol because the pipeline derives it from `strategy.symbol`.
+    """
+    portfolio = Portfolio(initial_balance=10_000.0)
+    engine = StubEngine(portfolio=portfolio)
+    shield = RiskShield(clock=_frozen_clock(T0))
+
+    class _SymbolRaisingStrategy(Strategy):
+        name = "symbol-raising"
+
+        def generate_signal(self, df: pd.DataFrame) -> TradingSignal:
+            raise ValueError("strategy failed")
+
+    pipeline = SignalPipeline(
+        _SymbolRaisingStrategy("ETH/USDT"),
+        shield,
+        engine,
+    )
+
+    result = _run(pipeline.run_once(pd.DataFrame()))
+
+    assert result.executed is False
+    assert result.signal.action == "HOLD"
+    assert result.signal.symbol == "ETH/USDT", (
+        "Fallback signal must preserve the strategy's symbol"
+    )
+    assert result.signal.confidence == 0.0
+
+
+def test_pipeline_handles_any_exception_type_in_strategy() -> None:
+    """The pipeline must catch any exception subclass from the strategy,
+    not only RuntimeError. After ContractValidator removal the guard is
+    only the try/except in the pipeline itself.
+    """
+    portfolio = Portfolio(initial_balance=10_000.0)
+    engine = StubEngine(portfolio=portfolio)
+    shield = RiskShield(clock=_frozen_clock(T0))
+
+    class _AttrErrorStrategy(Strategy):
+        name = "attr-error-strategy"
+
+        def generate_signal(self, df: pd.DataFrame) -> TradingSignal:
+            raise AttributeError("missing attribute")
+
+    pipeline = SignalPipeline(
+        _AttrErrorStrategy("BTC/USDT"),
+        shield,
+        engine,
+    )
+
+    result = _run(pipeline.run_once(pd.DataFrame()))
+
+    assert isinstance(result, PipelineResult)
+    assert result.executed is False
+    assert result.signal.action == "HOLD"
+    assert "missing attribute" in result.signal.reasoning
+    assert result.risk_decision.approved is False
+
+
+def test_sell_signal_passes_through_pipeline_without_validation_error() -> None:
+    """A SELL signal with valid confidence must flow through the pipeline
+    to the risk shield and (if approved) to execution.
+
+    Regression guard: ContractValidator.signal() validated signals inline;
+    its removal must not affect SELL signals (only BUY was exercised in the
+    original happy-path test).
+    """
+    portfolio = Portfolio(initial_balance=10_000.0)
+    engine = StubEngine(portfolio=portfolio)
+    shield = RiskShield(clock=_frozen_clock(T0))
+
+    sell_signal = TradingSignal(
+        symbol="BTC/USDT",
+        action="SELL",
+        confidence=0.75,
+        strategy="fixed-test-strategy",
+        entry_price=50_000.0,
+        stop_loss=51_000.0,
+        take_profit=48_000.0,
+    )
+    pipeline = SignalPipeline(
+        FixedSignalStrategy(sell_signal),
+        shield,
+        engine,
+    )
+
+    result = _run(pipeline.run_once(pd.DataFrame()))
+
+    # The signal must have propagated to the risk layer (not short-circuited).
+    assert result.signal.action == "SELL"
+    # If risk approved it, execution must have occurred.
+    if result.risk_decision.approved:
+        assert result.executed is True
+        assert result.position_size > 0.0
+    else:
+        assert result.executed is False
+
+
+def test_pipeline_returns_pipeline_result_not_exception_after_contract_validator_removal() -> None:
+    """The pipeline must never raise; it must always return a PipelineResult.
+
+    This is a broad regression guard for the ContractValidator removal:
+    removing the validation layer must not introduce any uncaught exception
+    path that previously the validator would have surfaced before them.
+    """
+    portfolio = Portfolio(initial_balance=5_000.0)
+    engine = StubEngine(portfolio=portfolio)
+    shield = RiskShield(clock=_frozen_clock(T0))
+
+    # Use maximum confidence to ensure the signal is as far from the
+    # non-actionable boundary as possible.
+    high_confidence_signal = TradingSignal(
+        symbol="BTC/USDT",
+        action="BUY",
+        confidence=1.0,
+        strategy="fixed-test-strategy",
+        entry_price=50_000.0,
+        stop_loss=49_000.0,
+        take_profit=52_000.0,
+    )
+    pipeline = SignalPipeline(
+        FixedSignalStrategy(high_confidence_signal),
+        shield,
+        engine,
+    )
+
+    result = _run(pipeline.run_once(pd.DataFrame()))
+
+    assert isinstance(result, PipelineResult)
+    # The pipeline must report a coherent state regardless of the
+    # risk shield's verdict.
+    assert result.signal.action == "BUY"
+    assert result.signal.confidence == 1.0

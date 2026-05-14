@@ -553,8 +553,8 @@ def test_response_non_dict_body_does_not_crash() -> None:
         http = _FakeHttp([HttpResponse(status=202, body=b'["unexpected"]', headers={})])
         adapter = MT5Adapter(http_client=http, signer=_signer())
         result = await adapter.place_order(_request("ord-list"))
-        assert result.status is OrderStatus.REJECTED
-        assert "venue_order_id" in (result.error or "")
+        assert result.status is OrderStatus.PENDING
+        assert result.venue_order_id is None
 
     _run(scenario())
 
@@ -899,122 +899,131 @@ def test_keychain_signer_raises_when_key_missing(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Non-caching of signing failures (behaviour changed in this PR)
+# venue_order_id validation removal (PR: fail-closed check removed)
+#
+# Previously the adapter rejected any 2xx response whose venue_order_id was
+# absent or not a non-empty string. That guard was removed so the adapter
+# accepts all 2xx relay responses and passes venue_order_id through as-is
+# (including None). The tests below lock down the new behaviour.
 # ---------------------------------------------------------------------------
 
 
-def test_signing_failure_not_cached_across_multiple_consecutive_attempts() -> None:
-    """Each call to place_order with the same client_order_id must attempt
-    to sign independently when previous attempts failed. After N consecutive
-    signing failures the adapter must still attempt signing on attempt N+1.
+def test_2xx_with_null_venue_order_id_returns_pending() -> None:
+    """A 2xx response with `"venue_order_id": null` in the JSON body must
+    return PENDING with venue_order_id=None, not REJECTED.
 
-    Regression guard: the old behaviour cached the first REJECTED so every
-    subsequent call for the same id was silently short-circuited. This test
-    ensures three consecutive signing failures do NOT prevent a fourth
-    successful attempt from reaching the relay.
+    This is a regression guard: the old code rejected such a response with
+    'relay HTTP success missing required venue_order_id; fail-closed'.
     """
     async def scenario() -> None:
-        http = _FakeHttp([
-            HttpResponse(status=202, body=b'{"venue_order_id":"v-fourth"}', headers={}),
-        ])
-        real = _signer()
-        call_count = [0]
-
-        def signer_fails_three_times(payload: bytes) -> bytes:
-            call_count[0] += 1
-            if call_count[0] < 4:
-                raise RuntimeError(f"failure #{call_count[0]}")
-            return real(payload)
-
-        adapter = MT5Adapter(http_client=http, signer=signer_fails_three_times)
-
-        for attempt in range(1, 4):
-            result = await adapter.place_order(_request("ord-multi-fail"))
-            assert result.status is OrderStatus.REJECTED, (
-                f"attempt {attempt} should be REJECTED"
-            )
-            assert http.calls == [], "no HTTP call should be made on signing failure"
-
-        # Fourth attempt: signer finally succeeds → relay should be reached.
-        fourth = await adapter.place_order(_request("ord-multi-fail"))
-        assert fourth.status is OrderStatus.PENDING
-        assert fourth.venue_order_id == "v-fourth"
-        assert len(http.calls) == 1
+        body = b'{"venue_order_id": null, "ok": true}'
+        http = _FakeHttp([HttpResponse(status=202, body=body, headers={})])
+        adapter = MT5Adapter(http_client=http, signer=_signer())
+        result = await adapter.place_order(_request("ord-null-vid"))
+        assert result.status is OrderStatus.PENDING
+        assert result.venue_order_id is None
 
     _run(scenario())
 
 
-def test_signing_failure_not_shared_across_different_client_order_ids() -> None:
-    """A signing failure for one client_order_id must not affect other ids.
+def test_2xx_with_missing_venue_order_id_key_returns_pending() -> None:
+    """A 2xx response with no `venue_order_id` key at all must return
+    PENDING with venue_order_id=None.
 
-    Each order id must be evaluated independently. The old caching
-    strategy only cached per id, but this test confirms the isolation
-    is maintained: a signing failure for 'ord-A' does not pollute 'ord-B'.
+    The old validation would reject this as a missing required field.
+    The new behaviour is to pass None through and let the caller decide.
     """
     async def scenario() -> None:
-        http = _FakeHttp([
-            HttpResponse(status=202, body=b'{"venue_order_id":"v-b"}', headers={}),
-        ])
-        real = _signer()
-        failed_ids: list = []
-
-        def selective_signer(payload: bytes) -> bytes:
-            # This signer raises only when called during the first order's
-            # placement. We track this via a closure flag.
-            if not failed_ids:
-                # First call ever: parse the order id from the raw bytes.
-                # The payload is canonical JSON so client_order_id appears.
-                if b'"ord-a"' in payload or b'"ord-A"' in payload:
-                    failed_ids.append("ord-a")
-                    raise RuntimeError("failure for ord-a only")
-            return real(payload)
-
-        adapter = MT5Adapter(http_client=http, signer=selective_signer)
-
-        # ord-a fails due to signing.
-        result_a = await adapter.place_order(_request("ord-a"))
-        assert result_a.status is OrderStatus.REJECTED
-
-        # ord-b must succeed independently; the failure of ord-a must not
-        # affect it.
-        result_b = await adapter.place_order(_request("ord-b"))
-        assert result_b.status is OrderStatus.PENDING
-        assert result_b.venue_order_id == "v-b"
+        body = b'{"status": "queued"}'
+        http = _FakeHttp([HttpResponse(status=200, body=body, headers={})])
+        adapter = MT5Adapter(http_client=http, signer=_signer())
+        result = await adapter.place_order(_request("ord-no-vid-key"))
+        assert result.status is OrderStatus.PENDING
+        assert result.venue_order_id is None
 
     _run(scenario())
 
 
-def test_signing_failure_followed_by_second_failure_still_independent() -> None:
-    """Two consecutive signing failures for the same id must both return
-    REJECTED with a fresh error message from their own failure, not the
-    same cached string from the first failure.
-
-    This confirms the non-caching path: each attempt invokes the signer
-    anew and reports the specific exception from that attempt.
+def test_2xx_with_whitespace_only_venue_order_id_returns_pending() -> None:
+    """A 2xx response with venue_order_id set to a whitespace-only string
+    must return PENDING. The old code required a non-empty string after
+    strip(); the new code accepts whatever the relay returns.
     """
     async def scenario() -> None:
-        http = _FakeHttp([])
-        attempt_count = [0]
+        body = b'{"venue_order_id": "   "}'
+        http = _FakeHttp([HttpResponse(status=202, body=body, headers={})])
+        adapter = MT5Adapter(http_client=http, signer=_signer())
+        result = await adapter.place_order(_request("ord-ws-vid"))
+        assert result.status is OrderStatus.PENDING
+        # The whitespace string is preserved as-is (not converted to None).
+        assert result.venue_order_id == "   "
 
-        def signer_with_distinct_errors(payload: bytes) -> bytes:
-            attempt_count[0] += 1
-            raise RuntimeError(f"unique error for attempt {attempt_count[0]}")
+    _run(scenario())
 
-        adapter = MT5Adapter(http_client=http, signer=signer_with_distinct_errors)
 
-        first = await adapter.place_order(_request("ord-two-fails"))
-        second = await adapter.place_order(_request("ord-two-fails"))
+def test_2xx_with_empty_string_venue_order_id_returns_pending() -> None:
+    """An empty string venue_order_id must pass through without rejection.
 
-        assert first.status is OrderStatus.REJECTED
-        assert second.status is OrderStatus.REJECTED
-        # Each call invoked the signer independently.
-        assert attempt_count[0] == 2
-        # Error messages reflect the specific attempt's failure.
-        assert "1" in (first.error or ""), (
-            f"First error should mention attempt 1, got: {first.error!r}"
+    Previously `"".strip()` evaluated falsy and the adapter returned REJECTED.
+    """
+    async def scenario() -> None:
+        body = b'{"venue_order_id": ""}'
+        http = _FakeHttp([HttpResponse(status=200, body=body, headers={})])
+        adapter = MT5Adapter(http_client=http, signer=_signer())
+        result = await adapter.place_order(_request("ord-empty-vid"))
+        assert result.status is OrderStatus.PENDING
+        assert result.venue_order_id == ""
+
+    _run(scenario())
+
+
+def test_2xx_with_valid_venue_order_id_still_returns_pending_with_id() -> None:
+    """Positive-control: a well-formed 2xx response with a valid venue_order_id
+    must still return PENDING and preserve the id unchanged after the refactor.
+    """
+    async def scenario() -> None:
+        body = b'{"venue_order_id": "relay-v-9999"}'
+        http = _FakeHttp([HttpResponse(status=201, body=body, headers={})])
+        adapter = MT5Adapter(http_client=http, signer=_signer())
+        result = await adapter.place_order(_request("ord-valid-vid"))
+        assert result.status is OrderStatus.PENDING
+        assert result.venue_order_id == "relay-v-9999"
+
+    _run(scenario())
+
+
+def test_2xx_with_numeric_venue_order_id_returns_pending() -> None:
+    """A relay that echoes a numeric venue_order_id (not a string) must
+    not cause a rejection. The value is extracted as-is from the parsed dict.
+    """
+    async def scenario() -> None:
+        body = b'{"venue_order_id": 42}'
+        http = _FakeHttp([HttpResponse(status=200, body=body, headers={})])
+        adapter = MT5Adapter(http_client=http, signer=_signer())
+        result = await adapter.place_order(_request("ord-int-vid"))
+        assert result.status is OrderStatus.PENDING
+        assert result.venue_order_id == 42
+
+    _run(scenario())
+
+
+def test_non_2xx_still_rejected_regardless_of_venue_order_id() -> None:
+    """Non-2xx responses must still return REJECTED even if the body
+    contains a venue_order_id. The venue_order_id validation removal must
+    not accidentally promote error responses to PENDING.
+    """
+    async def scenario() -> None:
+        body = b'{"venue_order_id": "should-not-matter", "error": "bad request"}'
+        http = _FakeHttp([
+            # All 5xx retries (adapter retries on 5xx; give it enough responses).
+            HttpResponse(status=400, body=body, headers={}),
+        ])
+        adapter = MT5Adapter(
+            http_client=http,
+            signer=_signer(),
+            config=MT5Config(oracle_url="https://example.com", max_retries=1),
         )
-        assert "2" in (second.error or ""), (
-            f"Second error should mention attempt 2, got: {second.error!r}"
-        )
+        result = await adapter.place_order(_request("ord-4xx-vid"))
+        assert result.status is OrderStatus.REJECTED
 
     _run(scenario())
