@@ -51,24 +51,25 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: "npm"
+          cache-dependency-path: money-machine/package-lock.json
 
       - name: Install frontend dependencies
-        run: npm ci
+        run: npm --prefix money-machine ci
 
       - name: Build frontend
-        run: npm run build
+        run: npm --prefix money-machine run build
 
       - name: Setup Python (for sidecar)
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Install Python dependencies
         run: |
-          cd src-python
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          python -m pip install -r money-machine/src-python/requirements.txt
 
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
@@ -77,11 +78,12 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
+          projectPath: money-machine
           args: ${{ matrix.args }}
           tagName: ${{ github.ref_name }}
-          releaseName: "Money Machine v__VERSION__"
-          releaseBody: "See the assets below for your platform."
-          releaseDraft: false
+          releaseName: "Money Machine ${{ github.ref_name }}"
+          releaseBody: "See CHANGELOG.md and the assets below for your platform."
+          releaseDraft: true
           prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') }}
 
       - name: Upload artifacts
@@ -89,12 +91,12 @@ jobs:
         with:
           name: money-machine-${{ matrix.platform }}-${{ matrix.target || 'default' }}
           path: |
-            src-tauri/target/release/bundle/**/*.dmg
-            src-tauri/target/release/bundle/**/*.app
-            src-tauri/target/release/bundle/**/*.deb
-            src-tauri/target/release/bundle/**/*.AppImage
-            src-tauri/target/release/bundle/**/*.msi
-            src-tauri/target/release/bundle/**/*.exe
+            money-machine/src-tauri/target/release/bundle/**/*.dmg
+            money-machine/src-tauri/target/release/bundle/**/*.app
+            money-machine/src-tauri/target/release/bundle/**/*.deb
+            money-machine/src-tauri/target/release/bundle/**/*.AppImage
+            money-machine/src-tauri/target/release/bundle/**/*.msi
+            money-machine/src-tauri/target/release/bundle/**/*.exe
 
   release:
     needs: build
@@ -110,9 +112,9 @@ jobs:
           path: artifacts
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: artifacts/**/*
           generate_release_notes: true
-          draft: false
+          draft: true
           prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') }}

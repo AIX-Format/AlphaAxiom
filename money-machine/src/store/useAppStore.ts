@@ -12,7 +12,7 @@ export interface Trade {
 
 export interface Portfolio {
     balance: number;
-    positions: Record<string, any>;
+    positions: Record<string, unknown>;
     pnl: number;
     timestamp: number;
 }

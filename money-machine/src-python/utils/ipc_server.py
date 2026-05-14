@@ -39,6 +39,9 @@ class IPCServer:
     # constructor args when the engine needs more headroom in tests.
     DEFAULT_RATE = 100.0
     DEFAULT_BURST = 200.0
+    MAX_AUTH_LINE_BYTES = 256
+    MAX_BODY_BYTES = 64 * 1024
+    DEFAULT_READ_TIMEOUT_SECONDS = 5.0
 
     def __init__(
         self,
@@ -48,6 +51,7 @@ class IPCServer:
         auth_token: Optional[str] = None,
         rate_limit: Optional[float] = None,
         burst_limit: Optional[float] = None,
+        read_timeout_seconds: float = DEFAULT_READ_TIMEOUT_SECONDS,
     ):
         self.host = host
         self.port = port
@@ -58,6 +62,7 @@ class IPCServer:
             rate=rate_limit if rate_limit is not None else self.DEFAULT_RATE,
             capacity=burst_limit if burst_limit is not None else self.DEFAULT_BURST,
         )
+        self.read_timeout_seconds = read_timeout_seconds
 
     async def start(self) -> None:
         """Start the TCP server and run until cancelled."""
@@ -100,11 +105,11 @@ class IPCServer:
 
     async def _process_request(self, reader: asyncio.StreamReader) -> dict:
         """Read auth header + JSON body, return a response dict."""
-        # Auth header: first line
-        try:
-            auth_line_bytes = await reader.readline()
-        except Exception as exc:
-            return {"error": f"Failed to read auth header: {exc}", "code": 400}
+        auth_line_bytes, auth_error = await self._read_limited_line(
+            reader, self.MAX_AUTH_LINE_BYTES, "auth header"
+        )
+        if auth_error:
+            return auth_error
 
         if not auth_line_bytes:
             return {"error": "Empty request", "code": 400}
@@ -119,11 +124,11 @@ class IPCServer:
         if not self._bucket.consume():
             return {"error": "Rate limit exceeded", "code": 429}
 
-        # JSON body: second line
-        try:
-            body_bytes = await reader.readline()
-        except Exception as exc:
-            return {"error": f"Failed to read request body: {exc}", "code": 400}
+        body_bytes, body_error = await self._read_limited_line(
+            reader, self.MAX_BODY_BYTES, "request body"
+        )
+        if body_error:
+            return body_error
 
         if not body_bytes:
             return {"error": "Missing request body after auth header", "code": 400}
@@ -140,6 +145,30 @@ class IPCServer:
             return {"error": "Missing 'command' field", "code": 400}
 
         return await self.command_handler(command, payload)
+
+    async def _read_limited_line(
+        self,
+        reader: asyncio.StreamReader,
+        limit: int,
+        label: str,
+    ) -> tuple[bytes, Optional[dict]]:
+        try:
+            line = await asyncio.wait_for(
+                reader.readuntil(b"\n"),
+                timeout=self.read_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            return b"", {"error": f"Timed out reading IPC {label}", "code": 408}
+        except asyncio.LimitOverrunError:
+            return b"", {"error": f"IPC {label} exceeds {limit} bytes", "code": 413}
+        except asyncio.IncompleteReadError as exc:
+            line = exc.partial
+        except Exception as exc:
+            return b"", {"error": f"Failed to read {label}: {exc}", "code": 400}
+
+        if len(line) > limit:
+            return b"", {"error": f"IPC {label} exceeds {limit} bytes", "code": 413}
+        return line, None
 
     async def stop(self) -> None:
         """Stop the server."""

@@ -57,7 +57,7 @@ async def _send_raw(host: str, port: int, raw: bytes) -> dict:
 
 
 async def _start_server(
-    rate: float = 100.0, burst: float = 200.0
+    rate: float = 100.0, burst: float = 200.0, read_timeout_seconds: float = 5.0
 ) -> Tuple[IPCServer, asyncio.Task, Tuple[str, int]]:
     server = IPCServer(
         command_handler=_echo_handler,
@@ -66,6 +66,7 @@ async def _start_server(
         auth_token=TEST_TOKEN,
         rate_limit=rate,
         burst_limit=burst,
+        read_timeout_seconds=read_timeout_seconds,
     )
 
     started = asyncio.Event()
@@ -204,6 +205,32 @@ def test_rate_limit_returns_429_after_burst() -> None:
             response = await _send_raw(host, port, wire)
             assert response.get("code") == 429, response
             assert "rate" in response.get("error", "").lower()
+        finally:
+            await _shutdown(server, task)
+
+    _run(scenario())
+
+
+def test_oversized_ipc_body_returns_413() -> None:
+    async def scenario() -> None:
+        server, task, (host, port) = await _start_server()
+        try:
+            oversized = b'{"command":"PING","payload":"' + (b"x" * (IPCServer.MAX_BODY_BYTES + 1)) + b'"}\n'
+            wire = f"X-Auth-Token: {TEST_TOKEN}\n".encode("utf-8") + oversized
+            response = await _send_raw(host, port, wire)
+            assert response.get("code") == 413, response
+        finally:
+            await _shutdown(server, task)
+
+    _run(scenario())
+
+
+def test_missing_body_times_out() -> None:
+    async def scenario() -> None:
+        server, task, (host, port) = await _start_server(read_timeout_seconds=0.05)
+        try:
+            response = await _send_raw(host, port, f"X-Auth-Token: {TEST_TOKEN}\n".encode("utf-8"))
+            assert response.get("code") == 408, response
         finally:
             await _shutdown(server, task)
 

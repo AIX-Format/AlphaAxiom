@@ -5,11 +5,9 @@
         "devUrl": "http://localhost:3000",
         "frontendDist": "../out"
     },
-    "package": {
-        "productName": "money-machine",
-        "version": "0.1.0",
-        "identifier": "com.antigravity.moneymachine"
-    },
+    "productName": "money-machine",
+    "version": "0.1.1-alpha",
+    "identifier": "com.antigravity.moneymachine",
     "app": {
         "windows": [
             {
@@ -25,7 +23,7 @@
             }
         ],
         "security": {
-            "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset: https://asset.localhost; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost https://oracle.axiomid.app https://aqt.axiomid.app"
+            "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset: https://asset.localhost; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost https://oracle.axiomid.app https://aitrading.axiomid.app https://aqt.axiomid.app"
         }
     },
     "bundle": {
