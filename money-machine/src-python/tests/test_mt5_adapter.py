@@ -1007,6 +1007,53 @@ def test_2xx_with_numeric_venue_order_id_returns_pending() -> None:
     _run(scenario())
 
 
+# ---------------------------------------------------------------------------
+# venue_order_id relaxation (PR: removed fail-closed check)
+# ---------------------------------------------------------------------------
+
+
+def test_place_order_accepts_missing_venue_order_id_in_2xx_dict_body() -> None:
+    """After removing the fail-closed venue_order_id check, a 2xx
+    response whose JSON dict does NOT contain `venue_order_id` must
+    produce a PENDING result with venue_order_id=None instead of
+    being rejected.
+    """
+    async def scenario() -> None:
+        body = b'{"status":"queued"}'  # valid dict, no venue_order_id key
+        http = _FakeHttp([HttpResponse(status=202, body=body, headers={})])
+        adapter = MT5Adapter(
+            http_client=http,
+            signer=_signer(),
+            config=MT5Config(max_retries=0),
+        )
+        result = await adapter.place_order(_request("ord-no-vid"))
+        assert result.status is OrderStatus.PENDING, result
+        assert result.venue_order_id is None
+
+    _run(scenario())
+
+
+def test_place_order_accepts_empty_string_venue_order_id_in_2xx_body() -> None:
+    """Before the PR the server would fail-closed if venue_order_id was
+    an empty string. The relaxed code must now accept it and surface the
+    empty string as venue_order_id rather than rejecting the order.
+    """
+    async def scenario() -> None:
+        body = b'{"venue_order_id":""}'
+        http = _FakeHttp([HttpResponse(status=202, body=body, headers={})])
+        adapter = MT5Adapter(
+            http_client=http,
+            signer=_signer(),
+            config=MT5Config(max_retries=0),
+        )
+        result = await adapter.place_order(_request("ord-empty-vid"))
+        assert result.status is OrderStatus.PENDING, result
+        # Empty string is falsy but no longer causes a rejection.
+        assert result.venue_order_id == ""
+
+    _run(scenario())
+
+
 def test_non_2xx_still_rejected_regardless_of_venue_order_id() -> None:
     """Non-2xx responses must still return REJECTED even if the body
     contains a venue_order_id. The venue_order_id validation removal must

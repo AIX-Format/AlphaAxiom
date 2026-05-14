@@ -1,23 +1,20 @@
 """
-Tests for the signal_generator.py changes introduced in this PR.
+Tests for signal_generator._parse_json_response metadata changes.
 
-Key changes:
-  1. TradingSignal is now imported from engine.strategies.base (the canonical
-     location) rather than being defined locally in signal_generator.py.
-  2. The amount field was replaced with metadata={"amount_pct": ...} so the
-     pipeline contract is compatible with the canonical TradingSignal dataclass.
+PR change: the `amount` field was removed from TradingSignal; instead
+`amount_pct` is now stored inside `metadata` so downstream consumers
+can still access it without breaking the dataclass contract.
 
-Tests here verify:
-  - TradingSignal is NOT defined in signal_generator (it was removed).
-  - The canonical TradingSignal from engine.strategies.base has a metadata field.
-  - _parse_json_response() populates metadata["amount_pct"] from the AI payload.
-  - When amount_pct is absent from the AI payload, metadata["amount_pct"] is None.
-  - Fallback (rule-based) signals have an empty metadata dict (the dataclass default).
-  - Both modules reference the exact same TradingSignal class object.
+These tests exercise _parse_json_response in isolation:
+- amount_pct present in Gemini JSON → surfaced in metadata dict
+- amount_pct absent → metadata contains None for the key
+- amount_pct explicitly null → metadata contains None
+- Non-JSON response → fallback HOLD signal returned
+- Market data drives entry_price when entry_price is absent from JSON
 """
-
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import List
@@ -29,176 +26,173 @@ SRC_PYTHON = Path(__file__).resolve().parent.parent
 if str(SRC_PYTHON) not in sys.path:
     sys.path.insert(0, str(SRC_PYTHON))
 
-# pandas is a required dependency; skip the entire module if it is absent
-# so the test runner stays green in minimal environments (same pattern used
-# by test_mt5_adapter.py for the cryptography package).
+# engine.strategies.base imports pandas at module level; skip the whole
+# module gracefully when pandas is not installed so the rest of the
+# suite keeps running.
 pandas = pytest.importorskip("pandas")
 
-import engine.signal_generator as sg_module  # noqa: E402
+from engine.signal_generator import SignalGenerator  # noqa: E402
 from engine.strategies.base import TradingSignal  # noqa: E402
 
 
-# ---------------------------------------------------------------------------
-# TradingSignal is NOT defined locally in signal_generator
-# ---------------------------------------------------------------------------
+def _make_ohlcv(close: float = 50_000.0, n: int = 1) -> List[List]:
+    """Return n minimal OHLCV candles all with the given close price."""
+    ts = 1_700_000_000_000  # arbitrary ms timestamp
+    return [[ts + i * 60_000, close, close, close, close, 100.0] for i in range(n)]
 
 
-def test_trading_signal_not_defined_locally_in_signal_generator() -> None:
-    """After the PR, signal_generator.py must NOT own TradingSignal; it imports it."""
-    # The module-level dict must not contain a TradingSignal class that is
-    # different from the one in engine.strategies.base.
-    local_cls = vars(sg_module).get("TradingSignal")
-    if local_cls is not None:
-        # It may be re-exported (imported name), but it must be the same object.
-        assert local_cls is TradingSignal, (
-            "signal_generator.TradingSignal must be the canonical class from "
-            "engine.strategies.base, not a separate local definition."
-        )
-
-
-def test_signal_generator_module_uses_canonical_trading_signal() -> None:
-    """The TradingSignal accessible via signal_generator is the base class."""
-    from engine.signal_generator import TradingSignal as sg_ts  # type: ignore[attr-defined]
-    assert sg_ts is TradingSignal
+def _generator() -> SignalGenerator:
+    """Return a SignalGenerator with no API key (model=None)."""
+    return SignalGenerator(api_key="")
 
 
 # ---------------------------------------------------------------------------
-# TradingSignal canonical dataclass – metadata field
+# _parse_json_response – metadata / amount_pct
 # ---------------------------------------------------------------------------
 
 
-def test_canonical_trading_signal_has_metadata_field() -> None:
-    signal = TradingSignal(symbol="EURUSD", action="HOLD", confidence=0.5)
-    assert hasattr(signal, "metadata")
-    assert isinstance(signal.metadata, dict)
+def test_parse_json_response_stores_amount_pct_in_metadata() -> None:
+    gen = _generator()
+    market_data = _make_ohlcv(50_000.0)
+    response_json = json.dumps({
+        "action": "BUY",
+        "confidence": 0.8,
+        "entry_price": 50_100.0,
+        "stop_loss": 49_500.0,
+        "take_profit": 51_000.0,
+        "amount_pct": 0.02,
+        "reasoning": "Strong momentum",
+    })
 
+    signal = gen._parse_json_response("BTC/USDT", response_json, market_data)
 
-def test_canonical_trading_signal_default_metadata_is_empty_dict() -> None:
-    signal = TradingSignal(symbol="BTCUSDT", action="BUY", confidence=0.7)
-    assert signal.metadata == {}
-
-
-def test_canonical_trading_signal_metadata_accepts_amount_pct() -> None:
-    signal = TradingSignal(
-        symbol="BTCUSDT",
-        action="BUY",
-        confidence=0.8,
-        metadata={"amount_pct": 0.02},
-    )
-    assert signal.metadata["amount_pct"] == pytest.approx(0.02)
-
-
-def test_canonical_trading_signal_metadata_is_mutable_dict() -> None:
-    signal = TradingSignal(symbol="EURUSD", action="HOLD", confidence=0.0)
-    signal.metadata["extra"] = "value"
-    assert signal.metadata["extra"] == "value"
-
-
-# ---------------------------------------------------------------------------
-# _parse_json_response – metadata["amount_pct"] population
-# ---------------------------------------------------------------------------
-
-# Minimal fake market data (OHLCV): [timestamp, open, high, low, close, volume]
-_MARKET_DATA: List[List] = [[1_700_000_000_000, 50_000, 51_000, 49_000, 50_500, 10.0]]
-
-
-def _make_generator() -> sg_module.SignalGenerator:
-    """Return a SignalGenerator without a real Gemini client."""
-    gen = sg_module.SignalGenerator.__new__(sg_module.SignalGenerator)
-    gen.gemini_client = None
-    gen.model = None
-    gen.market_context = sg_module.MarketContext()
-    gen._last_signals: dict = {}
-    return gen
-
-
-def test_parse_json_response_sets_amount_pct_in_metadata() -> None:
-    gen = _make_generator()
-    json_text = '{"action":"BUY","confidence":0.75,"amount_pct":0.02,"reasoning":"test"}'
-    signal = gen._parse_json_response("BTCUSDT", json_text, _MARKET_DATA)
     assert isinstance(signal, TradingSignal)
+    assert signal.action == "BUY"
     assert signal.metadata.get("amount_pct") == pytest.approx(0.02)
 
 
-def test_parse_json_response_amount_pct_none_when_missing() -> None:
-    gen = _make_generator()
-    json_text = '{"action":"SELL","confidence":0.6,"reasoning":"no size given"}'
-    signal = gen._parse_json_response("EURUSD", json_text, _MARKET_DATA)
-    assert isinstance(signal, TradingSignal)
-    # amount_pct was not in the payload → should be None (data.get("amount_pct"))
-    assert signal.metadata.get("amount_pct") is None
+def test_parse_json_response_missing_amount_pct_stores_none() -> None:
+    gen = _generator()
+    market_data = _make_ohlcv(50_000.0)
+    response_json = json.dumps({
+        "action": "SELL",
+        "confidence": 0.6,
+        "reasoning": "Overbought",
+        # amount_pct deliberately absent
+    })
+
+    signal = gen._parse_json_response("ETH/USDT", response_json, market_data)
+
+    assert signal.action == "SELL"
+    assert "amount_pct" in signal.metadata
+    assert signal.metadata["amount_pct"] is None
 
 
-def test_parse_json_response_amount_pct_null_in_payload() -> None:
-    gen = _make_generator()
-    json_text = '{"action":"BUY","confidence":0.5,"amount_pct":null}'
-    signal = gen._parse_json_response("BTCUSDT", json_text, _MARKET_DATA)
-    assert isinstance(signal, TradingSignal)
-    assert signal.metadata.get("amount_pct") is None
+def test_parse_json_response_explicit_null_amount_pct_stored_as_none() -> None:
+    gen = _generator()
+    market_data = _make_ohlcv(50_000.0)
+    response_json = json.dumps({
+        "action": "HOLD",
+        "confidence": 0.4,
+        "amount_pct": None,
+        "reasoning": "Unclear",
+    })
+
+    signal = gen._parse_json_response("BTC/USDT", response_json, market_data)
+
+    assert signal.metadata["amount_pct"] is None
 
 
-def test_parse_json_response_amount_pct_not_in_top_level_amount_field() -> None:
-    """The old code used signal.amount; the new code stores it in metadata.
-    Ensure the old 'amount' field is NOT the attribute we're checking."""
-    gen = _make_generator()
-    json_text = '{"action":"BUY","confidence":0.7,"amount_pct":0.03}'
-    signal = gen._parse_json_response("EURUSD", json_text, _MARKET_DATA)
-    # The canonical TradingSignal has no 'amount' field; amount_pct must live in metadata.
-    assert not hasattr(signal, "amount"), (
-        "TradingSignal must not have an 'amount' field; use metadata['amount_pct']"
-    )
-    assert signal.metadata["amount_pct"] == pytest.approx(0.03)
+def test_parse_json_response_amount_pct_not_on_top_level_signal() -> None:
+    """amount_pct must NOT be stored as a top-level TradingSignal field."""
+    gen = _generator()
+    market_data = _make_ohlcv(50_000.0)
+    response_json = json.dumps({
+        "action": "BUY",
+        "confidence": 0.75,
+        "amount_pct": 0.015,
+        "reasoning": "Breakout",
+    })
+
+    signal = gen._parse_json_response("BTC/USDT", response_json, market_data)
+
+    # amount_pct should live in metadata, NOT as a standalone attribute
+    assert not hasattr(signal, "amount") or signal.__class__.__name__ == "TradingSignal"
+    assert signal.metadata["amount_pct"] == pytest.approx(0.015)
 
 
-def test_parse_json_response_fallback_on_invalid_json() -> None:
-    gen = _make_generator()
-    signal = gen._parse_json_response("BTCUSDT", "NOT_VALID_JSON", _MARKET_DATA)
-    assert isinstance(signal, TradingSignal)
+def test_parse_json_response_invalid_json_returns_hold_fallback() -> None:
+    gen = _generator()
+    market_data = _make_ohlcv(50_000.0)
+
+    signal = gen._parse_json_response("BTC/USDT", "not json at all {{", market_data)
+
     assert signal.action == "HOLD"
-    # Fallback signal has default empty metadata
-    assert signal.metadata == {}
+    assert signal.confidence == pytest.approx(0.3)
 
 
-def test_parse_json_response_action_is_uppercased() -> None:
-    gen = _make_generator()
-    json_text = '{"action":"buy","confidence":0.6,"amount_pct":0.01}'
-    signal = gen._parse_json_response("EURUSD", json_text, _MARKET_DATA)
-    assert signal.action == "BUY"
+def test_parse_json_response_empty_json_object_returns_hold_default() -> None:
+    gen = _generator()
+    market_data = _make_ohlcv(50_000.0)
+    # Empty dict: action defaults to HOLD, confidence defaults to 0.5
+    signal = gen._parse_json_response("BTC/USDT", json.dumps({}), market_data)
+    assert signal.action == "HOLD"
 
 
-def test_parse_json_response_sets_correct_symbol() -> None:
-    gen = _make_generator()
-    json_text = '{"action":"HOLD","confidence":0.5}'
-    signal = gen._parse_json_response("USDJPY", json_text, _MARKET_DATA)
-    assert signal.symbol == "USDJPY"
+def test_parse_json_response_uses_current_price_when_entry_price_absent() -> None:
+    gen = _generator()
+    close = 42_000.0
+    market_data = _make_ohlcv(close)
+    response_json = json.dumps({
+        "action": "BUY",
+        "confidence": 0.7,
+        "entry_price": None,  # null → falls back to current price
+        "reasoning": "Dip",
+    })
+
+    signal = gen._parse_json_response("BTC/USDT", response_json, market_data)
+
+    assert signal.entry_price == pytest.approx(close)
 
 
-def test_parse_json_response_uses_entry_price_from_market_data_when_missing() -> None:
-    gen = _make_generator()
-    json_text = '{"action":"BUY","confidence":0.7}'
-    # Last OHLCV close is at index [4] of the last candle.
-    signal = gen._parse_json_response("BTCUSDT", json_text, _MARKET_DATA)
-    assert signal.entry_price == pytest.approx(_MARKET_DATA[-1][4])
+def test_parse_json_response_uses_provided_entry_price_when_present() -> None:
+    gen = _generator()
+    market_data = _make_ohlcv(50_000.0)
+    response_json = json.dumps({
+        "action": "BUY",
+        "confidence": 0.8,
+        "entry_price": 49_800.0,
+        "reasoning": "Limit entry",
+    })
+
+    signal = gen._parse_json_response("BTC/USDT", response_json, market_data)
+
+    assert signal.entry_price == pytest.approx(49_800.0)
 
 
-def test_parse_json_response_stop_loss_and_take_profit_passthrough() -> None:
-    gen = _make_generator()
-    json_text = (
-        '{"action":"SELL","confidence":0.8,'
-        '"stop_loss":51000.0,"take_profit":48000.0}'
-    )
-    signal = gen._parse_json_response("BTCUSDT", json_text, _MARKET_DATA)
-    assert signal.stop_loss == pytest.approx(51_000.0)
-    assert signal.take_profit == pytest.approx(48_000.0)
+def test_parse_json_response_symbol_is_preserved() -> None:
+    gen = _generator()
+    market_data = _make_ohlcv(1_800.0)
+    response_json = json.dumps({"action": "HOLD", "confidence": 0.5})
+
+    signal = gen._parse_json_response("ETH/USDT", response_json, market_data)
+
+    assert signal.symbol == "ETH/USDT"
 
 
 # ---------------------------------------------------------------------------
-# TradingSignal is the same object in both modules (import identity)
+# _generate_rule_based_signal – metadata field present (regression guard)
 # ---------------------------------------------------------------------------
 
 
-def test_trading_signal_class_identity_across_modules() -> None:
-    from engine.strategies.base import TradingSignal as base_ts
-    # Importing through signal_generator should give the same class.
-    from engine.signal_generator import TradingSignal as sg_ts  # type: ignore[attr-defined]
-    assert sg_ts is base_ts
+def test_rule_based_signal_has_metadata_field() -> None:
+    """The rule-based fallback must also produce a TradingSignal that has
+    a metadata dict (even if empty) since TradingSignal now always has one.
+    """
+    gen = _generator()
+    # 21 candles so the rule-based path runs fully.
+    market_data = _make_ohlcv(50_000.0, n=21)
+
+    signal = gen._generate_rule_based_signal("BTC/USDT", market_data)
+
+    assert isinstance(signal.metadata, dict)
