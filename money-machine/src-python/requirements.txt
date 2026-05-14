@@ -8,7 +8,7 @@ google-generativeai>=0.3.0
 pyyaml>=6.0
 python-dotenv>=1.2.2
 # IPC auth token storage (optional; falls back to env var when missing).
-keyring>=24.0.0
+keyring>=25.7.0
 # Ed25519 signing for the MT5 adapter (signed signals to the Worker relay).
 # Pinned >=44.0.0 to clear the NULL pointer dereference, OpenSSL
 # subgroup attack, and buffer overflow CVEs that affect the 42.x
