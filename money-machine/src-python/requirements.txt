@@ -13,7 +13,7 @@ keyring>=24.0.0
 # Pinned >=44.0.0 to clear the NULL pointer dereference, OpenSSL
 # subgroup attack, and buffer overflow CVEs that affect the 42.x
 # and 45.x series. Bump again if a new advisory lands.
-cryptography>=44.0.0
+cryptography>=48.0.0
 # EVM transaction signing for the on-chain swap adapter.
 eth-account>=0.10.0
 # Gymnasium env contract for the RL surface in engine.rl.
