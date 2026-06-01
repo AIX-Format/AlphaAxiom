@@ -1,6 +1,6 @@
 # Money Machine - Python Trading Engine
 
-ccxt>=4.5.53
+ccxt>=4.5.56
 pandas>=2.0.0
 numpy>=2.4.4
 aiohttp>=3.9.0
